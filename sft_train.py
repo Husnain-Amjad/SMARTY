@@ -434,12 +434,14 @@ def main():
             bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
         )
 
-    model, attn_used = load_model_with_best_attention(
-        AutoModelForCausalLM, args.model,
-        torch_dtype="bfloat16" if args.bf16 else "auto",
-        device_map="auto" if args.mode == "lora" else None,
-        quantization_config=quantization_config,
+    model = AutoModelForCausalLM.from_pretrained(
+    args.model,
+    torch_dtype="bfloat16" if args.bf16 else "auto",
+    device_map="auto" if args.mode == "lora" else None,
+    quantization_config=quantization_config,
+    attn_implementation="flash_attention_2",
     )
+    
     if args.torch_compile:
         model = torch.compile(model)
 
