@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "Unpublished thesis work. All rights reserved - no license is granted to use, copy, modify, or distribute this work until the authors publish or relicense it. Contact the authors regarding citation or use."
+title: "SMART: Skill-aware Mathematical Adaptation with Replay and Reinforcement Training"
+authors:
+  - family-names: "Amjad"
+    given-names: "Husnain"
+    affiliation: "National University of Sciences and Technology, Pakistan"
+  - family-names: "Fatima"
+    given-names: "Mehwish"
+    affiliation: "National University of Sciences and Technology, Pakistan"
+date-released: 2026-01-01
+repository-code: "https://github.com/<your-username>/<your-repo>"
+keywords:
+  - large language models
+  - mathematical reasoning
+  - metacognition
+  - catastrophic forgetting
+  - data augmentation
+  - parameter-efficient fine-tuning
+  - reinforcement learning

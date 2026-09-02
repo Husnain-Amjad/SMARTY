@@ -1,0 +1,56 @@
+# ============================================================================
+# Complete dependency specification for this repository. Primary target:
+# NVIDIA CUDA GPUs (local server or cluster). Google Colab is supported for
+# rapid iteration/testing - see README.md's Platform-Specific Setup section
+# for the small number of environment-specific notes that apply there.
+#
+# RECOMMENDED SETUP (installs everything below in one pass, correctly ordered):
+#   bash experiments/setup_environment.sh
+#
+# This file remains as an explicit, complete reference of every dependency -
+# nothing needed to run this repository is left undocumented. If installing
+# manually instead of via the setup script, run the commands in the order
+# shown below (torch and vllm before the plain `pip install -r requirements.txt`
+# for the rest, since torch's install command is hardware-specific and must
+# come from PyTorch's own index, not PyPI's default index).
+# ============================================================================
+
+# ---- Step 1: PyTorch (CUDA build - install this FIRST, from PyTorch's own
+# index, not from this requirements file directly) ----
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Adjust the cu1XX suffix to match your actual CUDA version (`nvidia-smi`
+# reports this) if it differs from 12.1.
+
+# ---- Step 2: vLLM (install after torch, from PyPI) ----
+#   pip install vllm
+
+# ---- Step 3: everything else (this file) ----
+transformers>=4.46
+accelerate>=0.34
+peft>=0.13
+trl>=0.12
+datasets>=2.20
+sympy>=1.12
+matplotlib>=3.7
+huggingface_hub>=0.25
+graphviz>=0.20
+markdown>=3.6
+torchao>=0.1.6
+antlr4-python3-runtime==4.11  # exact pin: required by sympy's latex parser, known-fragile across versions
+
+# ---- Optional (skipped automatically with no loss of correctness if
+# unavailable - see hardware_utils.py's automatic sdpa fallback) ----
+#   pip install flash-attn --no-build-isolation
+# Requires compute capability >= 8.0 (Ampere/A100 or newer). Can take a long
+# time to compile if no prebuilt wheel matches your exact torch/CUDA/Python
+# combination - that is expected, not a hang.
+
+# ---- Optional, only if using --use_bnb 4-bit QLoRA ----
+#   pip install bitsandbytes
+
+# ============================================================================
+# Google Colab note: torch/CUDA usually ship pre-matched already in the Colab
+# runtime image - do NOT run Step 1 above unless check_environment.py
+# specifically flags torch as missing or incompatible. Steps 2 and 3 apply
+# the same way as any other environment.
+# ============================================================================
