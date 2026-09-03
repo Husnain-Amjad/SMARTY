@@ -6,7 +6,7 @@
 #
 # Install vLLM separately:
 #   uv pip install "vllm==0.27.1" --torch-backend=auto
-#
+#   uv pip install --no-cache-dir pyarrow==25.0.1
 # Then install this file:
 #   uv pip install -r requirements.txt
 #
