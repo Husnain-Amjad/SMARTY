@@ -296,7 +296,10 @@ def build_replay_mixed_dataset(original_path, extra_paths, replay_ratio, strateg
     print(f"[replay-mix] strategy={strategy} original={len(orig_sample)} augmented={len(aug_sample)} "
           f"ratio_actual={len(orig_sample)/len(mixed):.2f}")
     return mixed
-
+def ensure_output_path(path):
+        directory = os.path.dirname(os.path.abspath(path))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -504,6 +507,8 @@ def main():
               f"{steps_per_epoch} optimizer steps/epoch -> checkpointing every "
               f"{save_steps} steps (~{args.save_every_epochs} epoch)")
 
+
+    
     trainer.add_callback(TrainingLogCallback(
         log_path=os.path.join(args.output_dir, "training_log.jsonl"),
         run_label=os.path.basename(args.output_dir.rstrip("/")),
@@ -528,7 +533,7 @@ def main():
     elif args.resume_from_checkpoint:
         resume_path = args.resume_from_checkpoint
         print(f"[sft_train] resuming from explicit checkpoint: {resume_path}")
-
+    ensure_output_path(args.output_dir)
     ensure_dir(args.output_dir)
     trainer.train(resume_from_checkpoint=resume_path)
     trainer.save_model(args.output_dir)
