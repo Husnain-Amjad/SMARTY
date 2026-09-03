@@ -65,10 +65,10 @@ mkdir -p "$OUT" "$CKPT"
 # Token is read from HF_TOKEN in the environment - never hardcode it here.
 # ============================================================================
 
-export SMART_HF_SFT_REPO="${SMART_HF_SFT_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_SFT}"
-export SMART_HF_REPLAY_REPO="${SMART_HF_REPLAY_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_Replay_SFT}"
-export SMART_HF_GRPO_REPO="${SMART_HF_GRPO_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_GRPO}"
-export SMART_HF_OUTPUTS_REPO="${SMART_HF_OUTPUTS_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_Outputs}"
+export SMART_HF_SFT_REPO="${SMART_HF_SFT_REPO:-HusnainAmjad/Deepseek_Math_7b_r1_SFT}"
+export SMART_HF_REPLAY_REPO="${SMART_HF_REPLAY_REPO:-HusnainAmjad/Deepseek_Math_7b_r1_Replay_SFT}"
+export SMART_HF_GRPO_REPO="${SMART_HF_GRPO_REPO:-HusnainAmjad/Deepseek_Math_7b_r1_GRPO}"
+export SMART_HF_OUTPUTS_REPO="${SMART_HF_OUTPUTS_REPO:-HusnainAmjad/Deepseek_Math_7b_r1_Outputs}"
 
 if [ -z "${HF_TOKEN:-}" ] && [ -z "${SMART_HF_DISABLE:-}" ]; then
     echo "[HF] WARNING: HF_TOKEN is not set. Uploads will fail."
