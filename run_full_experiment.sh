@@ -3,33 +3,33 @@
 # run_full_experiment.sh - SMART experiment ladder
 #
 #   Stage 0 : Baseline (untrained)
+#   Stage 1 : SFT on ORIGINAL Hendrycks MATH train      <- control arm
+#   Stage 2 : SFT on Skill_MATH                          <- skill supervision
+#   Stage 3 : Augmentation generation (semantic + numeric)
+#   Stage 4 : SFT + simple replay          (Skill_MATH)
+#             SFT + semantic replay        (Skill_MATH + semantic aug)
+#             SFT + numeric replay         (Skill_MATH + numeric aug)
+#             SFT + both replay            (Skill_MATH + both augs)
+#   Stage 5 : GRPO on each of the five Skill_MATH SFT models
 #
-#   Stage 1a: SFT on ORIGINAL Hendrycks MATH train   <- control arm
-#   Stage 1b: SFT on Skill_MATH (skill-labeled)
-#
-#   Stage 2 : Simple Replay              (Skill_MATH)
-#   Stage 2 : Semantic Augmentation      (Skill_MATH + semantic)
-#   Stage 2 : Numeric Augmentation       (Skill_MATH + numeric)
-#   Stage 2 : Semantic + Numeric         (Skill_MATH + both)
-#
-#   Stage 3 : GRPO on each of the six SFT variants above
+#   Total: 12 evaluation runs
+#     1 baseline + 6 SFT (1 original + 5 skill-based) + 5 GRPO
 #
 # NOTES
 #   - Training (SFT/GRPO) always uses flash-attention-2. No sdpa fallback.
 #   - All inference/evaluation uses vLLM via --use_vllm.
-#   - The TEST split is the ORIGINAL Hendrycks MATH test set. It has no skill
-#     annotations, so skill-prediction/skill-usage metrics report N/A there;
+#   - Only END evaluation per stage. Per-checkpoint evaluation is NOT part of
+#     this script (run_multi_checkpoint_eval.py still exists and can be run
+#     standalone if retention curves are wanted later).
+#   - The TEST split is the ORIGINAL Hendrycks MATH test set. It carries no
+#     skill annotations, so skill-prediction/skill-usage report N/A there;
 #     final-answer accuracy, format compliance and arithmetic consistency are
 #     all computed normally.
-#   - Per-checkpoint evaluation is written but COMMENTED OUT (see the
-#     "OPTIONAL" blocks). Uncomment if you want retention curves.
 #
-# HUGGING FACE (optional). Set these to auto-upload; unset = no uploads:
-#   export HF_TOKEN=hf_xxx
-#   export SMART_HF_SFT_REPO="you/sft_model_name"
-#   export SMART_HF_REPLAY_REPO="you/replay_augm_sft_model_name"
-#   export SMART_HF_GRPO_REPO="you/GRPO_model_name"
-#   export SMART_HF_OUTPUTS_REPO="you/model_name_outputs_results"
+# HUGGING FACE
+#   Repos below are pre-set. Only the token must come from the environment:
+#       export HF_TOKEN=hf_xxxxxxxx
+#   Set SMART_HF_DISABLE=1 to skip all uploads.
 #
 # Usage:
 #   ./run_full_experiment.sh <MODEL> [TRAIN_N] [TEST_N]
@@ -56,7 +56,23 @@ LEDGER="outputs/experiment_ledger.jsonl"
 mkdir -p "$OUT" "$CKPT"
 
 # ============================================================================
-# TRAINING SETTINGS
+# HUGGING FACE REPOSITORIES
+# Token is read from HF_TOKEN in the environment - never hardcode it here.
+# ============================================================================
+export SMART_HF_SFT_REPO="${SMART_HF_SFT_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_SFT}"
+export SMART_HF_REPLAY_REPO="${SMART_HF_REPLAY_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_Replay_SFT}"
+export SMART_HF_GRPO_REPO="${SMART_HF_GRPO_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_GRPO}"
+export SMART_HF_OUTPUTS_REPO="${SMART_HF_OUTPUTS_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_Outputs}"
+
+if [ -z "${HF_TOKEN:-}" ] && [ -z "${SMART_HF_DISABLE:-}" ]; then
+    echo "[HF] WARNING: HF_TOKEN is not set. Uploads will fail (the run itself will"
+    echo "     continue - all artifacts stay on local disk). Either:"
+    echo "       export HF_TOKEN=hf_xxxxxxxx        # to enable uploads"
+    echo "       export SMART_HF_DISABLE=1          # to silence this and skip uploads"
+fi
+
+# ============================================================================
+# TRAINING SETTINGS (all overridable via environment)
 # ============================================================================
 EPOCHS="${EPOCHS:-5}"
 SAVE_EVERY_EPOCHS="${SAVE_EVERY_EPOCHS:-1}"
@@ -65,7 +81,7 @@ GRAD_ACCUM="${GRAD_ACCUM:-2}"
 LORA_R="${LORA_R:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
 REPLAY_RATIO="${REPLAY_RATIO:-0.7}"
-REPLAY_MODE="${REPLAY_MODE:-additive}"      # additive = augmented data GROWS the set
+REPLAY_MODE="${REPLAY_MODE:-additive}"
 GRPO_EPOCHS="${GRPO_EPOCHS:-5}"
 GRPO_GENERATIONS="${GRPO_GENERATIONS:-4}"
 
@@ -86,7 +102,7 @@ else
     LIMIT_ARG=(--limit "$TEST_N")
 fi
 
-# Augmentation draws from the full split unless capped. Without this a small
+# Augmentation draws from the full split unless capped - without this a small
 # smoke test still generates thousands of augmented examples.
 if [ "$TRAIN_N" = "full" ]; then
     AUG_SOURCE_ARG=()
@@ -109,17 +125,20 @@ echo "CHECKPOINTS:           $CKPT"
 echo "LEDGER:                $LEDGER"
 echo "ATTENTION:             flash_attention_2 (forced, no sdpa)"
 echo "INFERENCE:             vLLM"
+echo "CHECKPOINT EVAL:       not part of this script (end eval only)"
 echo "EPOCHS (SFT/GRPO):     $EPOCHS / $GRPO_EPOCHS"
 echo "REPLAY MODE:           $REPLAY_MODE (ratio $REPLAY_RATIO)"
 echo "vLLM GPU UTILIZATION:  $VLLM_GPU_MEMORY"
 echo "vLLM MAX MODEL LEN:    $VLLM_MAX_MODEL_LEN"
 echo "vLLM TP:               $VLLM_TENSOR_PARALLEL"
 echo "vLLM MAX TOKENS:       $VLLM_MAX_TOKENS"
-echo "CHECKPOINT EVAL:       DISABLED (commented out)"
-echo "HF MODEL REPOS:        sft=${SMART_HF_SFT_REPO:-<unset>}"
-echo "                       replay=${SMART_HF_REPLAY_REPO:-<unset>}"
-echo "                       grpo=${SMART_HF_GRPO_REPO:-<unset>}"
-echo "HF OUTPUTS REPO:       ${SMART_HF_OUTPUTS_REPO:-<unset>}"
+echo "------------------------------------------------------------"
+echo "HF SFT REPO:           $SMART_HF_SFT_REPO"
+echo "HF REPLAY REPO:        $SMART_HF_REPLAY_REPO"
+echo "HF GRPO REPO:          $SMART_HF_GRPO_REPO"
+echo "HF OUTPUTS DATASET:    $SMART_HF_OUTPUTS_REPO"
+echo "HF TOKEN:              ${HF_TOKEN:+set}${HF_TOKEN:-NOT SET}"
+echo "HF UPLOADS:            ${SMART_HF_DISABLE:+DISABLED}${SMART_HF_DISABLE:-enabled}"
 echo "============================================================"
 
 # ============================================================================
@@ -180,11 +199,12 @@ run_log() {
     echo "[OK] Ledger entry completed."
 }
 
-# Push one merged checkpoint. Family (sft/replay/grpo) is auto-routed from the
-# variant name by hf_sync.py. No-op when the repo env vars are unset.
+# Push a merged checkpoint. hf_sync.py routes it to the SFT / Replay / GRPO
+# repo automatically from the variant name. Never fatal - a failed upload must
+# not lose a multi-hour training run.
 push_model_hf() {
     local LOCAL_DIR="$1"; local VARIANT="$2"
-    if [ -z "${SMART_HF_SFT_REPO:-}${SMART_HF_REPLAY_REPO:-}${SMART_HF_GRPO_REPO:-}" ]; then
+    if [ -n "${SMART_HF_DISABLE:-}" ]; then
         return 0
     fi
     echo ""
@@ -193,13 +213,13 @@ push_model_hf() {
         --local "$LOCAL_DIR" \
         --model-slug "$MODEL_SLUG" \
         --variant "$VARIANT" \
-        || echo "[HF] WARNING: push of $VARIANT failed - continuing"
+        || echo "[HF] WARNING: push of $VARIANT failed - local checkpoint intact, continuing"
 }
 
 # ============================================================================
-# SHARED DATA
-#   sft_data_original.jsonl  - ORIGINAL Hendrycks MATH   (control arm)
-#   sft_data.jsonl           - Skill_MATH (skill-labeled)
+# DATA PREPARATION
+#   sft_data_original.jsonl - ORIGINAL Hendrycks MATH  (control arm)
+#   sft_data.jsonl          - Skill_MATH (skill-labeled), used by everything else
 # ============================================================================
 echo ""
 echo "======================================================================"
@@ -260,12 +280,9 @@ run_log "${MODEL_SLUG}__baseline" \
 
 # ============================================================================
 # SFT VARIANT FUNCTION
-#   $1 variant name
-#   $2 training data file
+#   $1 variant name        $2 training data file
 #   $3 extra (augmented) data, "" for none
-#   $4 use replay strategy? "yes"/"no"
-#   $5 ledger baseline run_id
-#   $6 notes
+#   $4 use replay? yes/no  $5 ledger baseline run_id   $6 notes
 # ============================================================================
 run_sft_variant() {
     local VARIANT_NAME="$1"
@@ -280,9 +297,9 @@ run_sft_variant() {
     echo "======================================================================"
     echo "SFT VARIANT: $VARIANT_NAME"
     echo "======================================================================"
-    echo "[SFT] data:        $DATA_FILE"
-    echo "[SFT] extra data:  ${EXTRA_DATA:-<none>}"
-    echo "[SFT] replay:      $USE_REPLAY"
+    echo "[SFT] data:       $DATA_FILE"
+    echo "[SFT] extra data: ${EXTRA_DATA:-<none>}"
+    echo "[SFT] replay:     $USE_REPLAY"
 
     local REPLAY_ARGS=()
     if [ "$USE_REPLAY" = "yes" ]; then
@@ -292,7 +309,7 @@ run_sft_variant() {
 
     local EXTRA_ARGS=()
     if [ -n "$EXTRA_DATA" ]; then
-        # unquoted on purpose: may be two space-separated paths
+        # unquoted on purpose: may hold two space-separated paths
         EXTRA_ARGS=(--extra_data $EXTRA_DATA)
     fi
 
@@ -324,28 +341,10 @@ run_sft_variant() {
             "$NOTES"
 
     push_model_hf "${OUT_DIR}_merged" "$VARIANT_NAME"
-
-    # ------------------------------------------------------------------------
-    # OPTIONAL: per-checkpoint evaluation (retention curves).
-    # Uncomment to enable. Costs a full vLLM engine startup per checkpoint.
-    # ------------------------------------------------------------------------
-    # python run_multi_checkpoint_eval.py \
-    #     --checkpoints_dir "$OUT_DIR" \
-    #     --base_model "$MODEL" \
-    #     --mode lora \
-    #     --split test \
-    #     "${LIMIT_ARG[@]}" \
-    #     --use_vllm \
-    #     --checkpoint_stride 1 \
-    #     --out-dir "$OUT/checkpoint_eval_${VARIANT_NAME}" \
-    #     --ledger "$LEDGER" \
-    #     --run_id_prefix "${MODEL_SLUG}__${VARIANT_NAME}_ckpts" \
-    #     --baseline_run_id "$BASELINE_ID" \
-    #     || echo "[WARN] checkpoint eval for $VARIANT_NAME did not complete - continuing"
 }
 
 # ============================================================================
-# STAGE 1a - SFT ON ORIGINAL HENDRYCKS MATH  (control arm)
+# STAGE 1 - SFT ON ORIGINAL HENDRYCKS MATH  (control arm)
 # ============================================================================
 run_sft_variant "sft_original" \
     "$OUT/sft_data_original.jsonl" "" "no" \
@@ -353,7 +352,7 @@ run_sft_variant "sft_original" \
     "SFT on ORIGINAL Hendrycks MATH (no skill labels), n=$TEST_N"
 
 # ============================================================================
-# STAGE 1b - SFT ON SKILL_MATH
+# STAGE 2 - SFT ON SKILL_MATH  (skill supervision)
 # ============================================================================
 run_sft_variant "sft_skill" \
     "$OUT/sft_data.jsonl" "" "no" \
@@ -361,11 +360,11 @@ run_sft_variant "sft_skill" \
     "SFT on Skill_MATH (skill-labeled), n=$TEST_N"
 
 # ============================================================================
-# STAGE 2 - DIAGNOSIS
+# STAGE 3 - DIAGNOSIS + AUGMENTATION GENERATION
 # ============================================================================
 echo ""
 echo "======================================================================"
-echo "STAGE 2: DIAGNOSIS"
+echo "STAGE 3: DIAGNOSIS"
 echo "======================================================================"
 
 python data_pipeline.py --diagnose \
@@ -374,12 +373,9 @@ python data_pipeline.py --diagnose \
 cat "$OUT/weak_clusters.json"
 echo "[OK] Diagnosis completed."
 
-# ============================================================================
-# STAGE 2 - AUGMENTATION
-# ============================================================================
 echo ""
 echo "======================================================================"
-echo "STAGE 2: AUGMENTATION"
+echo "STAGE 3: AUGMENTATION GENERATION"
 echo "======================================================================"
 
 echo "[AUG] semantic..."
@@ -405,7 +401,7 @@ python run_augmentation.py \
 echo "[OK] Numeric augmentation completed."
 
 # ============================================================================
-# STAGE 2 VARIANTS
+# STAGE 4 - REPLAY VARIANTS  (all on Skill_MATH)
 # ============================================================================
 run_sft_variant "simple_replay" \
     "$OUT/sft_data.jsonl" "" "yes" \
@@ -428,16 +424,16 @@ run_sft_variant "both_replay" \
     "Skill_MATH + semantic & numeric augmentation + replay, n=$TEST_N"
 
 # ============================================================================
-# STAGE 3 - GRPO FUNCTION
+# STAGE 5 - GRPO FUNCTION
 # ============================================================================
-run_stage3_grpo() {
+run_stage5_grpo() {
     local BASE_NAME="$1"
     local BASE_MODEL_DIR="$2"
     local GRPO_DIR="${CKPT}/grpo_${BASE_NAME}"
 
     echo ""
     echo "======================================================================"
-    echo "STAGE 3: GRPO ON ${BASE_NAME}"
+    echo "STAGE 5: GRPO ON ${BASE_NAME}"
     echo "======================================================================"
 
     python grpo_train.py \
@@ -467,34 +463,21 @@ run_stage3_grpo() {
             "GRPO on ${BASE_NAME}, n=$TEST_N"
 
     push_model_hf "${GRPO_DIR}_merged" "grpo_${BASE_NAME}"
-
-    # ------------------------------------------------------------------------
-    # OPTIONAL: per-checkpoint GRPO evaluation. Uncomment to enable.
-    # ------------------------------------------------------------------------
-    # python run_multi_checkpoint_eval.py \
-    #     --checkpoints_dir "$GRPO_DIR" \
-    #     --base_model "$BASE_MODEL_DIR" \
-    #     --mode lora \
-    #     --split test \
-    #     "${LIMIT_ARG[@]}" \
-    #     --use_vllm \
-    #     --checkpoint_stride 1 \
-    #     --out-dir "$OUT/checkpoint_eval_grpo_${BASE_NAME}" \
-    #     --ledger "$LEDGER" \
-    #     --run_id_prefix "${MODEL_SLUG}__grpo_${BASE_NAME}_ckpts" \
-    #     --baseline_run_id "${MODEL_SLUG}__baseline" \
-    #     || echo "[WARN] checkpoint eval for grpo_${BASE_NAME} did not complete - continuing"
 }
 
 # ============================================================================
-# STAGE 3 - GRPO ON ALL SIX SFT VARIANTS
+# STAGE 5 - GRPO ON THE FIVE SKILL_MATH SFT MODELS
+#
+# NOTE: GRPO is applied to the Skill_MATH-based models only, per the specified
+# ladder. sft_original gets SFT + evaluation but no GRPO. To add it (which
+# would complete the ablation - GRPO-on-original vs GRPO-on-skill), uncomment:
+#   run_stage5_grpo "sft_original" "${CKPT}/sft_original_merged"
 # ============================================================================
-run_stage3_grpo "sft_original"  "${CKPT}/sft_original_merged"
-run_stage3_grpo "sft_skill"     "${CKPT}/sft_skill_merged"
-run_stage3_grpo "simple_replay" "${CKPT}/simple_replay_merged"
-run_stage3_grpo "sem_replay"    "${CKPT}/sem_replay_merged"
-run_stage3_grpo "num_replay"    "${CKPT}/num_replay_merged"
-run_stage3_grpo "both_replay"   "${CKPT}/both_replay_merged"
+run_stage5_grpo "sft_skill"     "${CKPT}/sft_skill_merged"
+run_stage5_grpo "simple_replay" "${CKPT}/simple_replay_merged"
+run_stage5_grpo "sem_replay"    "${CKPT}/sem_replay_merged"
+run_stage5_grpo "num_replay"    "${CKPT}/num_replay_merged"
+run_stage5_grpo "both_replay"   "${CKPT}/both_replay_merged"
 
 # ============================================================================
 # REPORTS
@@ -507,12 +490,12 @@ python experiment_ledger.py --print --ledger "$LEDGER"
 python generate_all_reports.py --ledger "$LEDGER" --out_dir outputs/report
 
 # ============================================================================
-# HUGGING FACE - PUSH ALL ARTIFACTS
+# HUGGING FACE - PUSH ALL ARTIFACTS TO THE OUTPUTS DATASET
 # ============================================================================
-if [ -n "${SMART_HF_OUTPUTS_REPO:-}" ]; then
+if [ -z "${SMART_HF_DISABLE:-}" ]; then
     echo ""
     echo "======================================================================"
-    echo "PUSHING ARTIFACTS TO HUGGING FACE"
+    echo "PUSHING ARTIFACTS TO $SMART_HF_OUTPUTS_REPO"
     echo "======================================================================"
     python hf_sync.py --push-outputs --model-slug "$MODEL_SLUG" \
         || echo "[HF] WARNING: outputs push failed - local artifacts are intact"
@@ -528,25 +511,25 @@ echo "======================================================================"
 echo "MODEL: $MODEL"
 echo ""
 echo "Stage 0:  ${MODEL_SLUG}__baseline"
-echo ""
 echo "Stage 1:  ${MODEL_SLUG}__sft_original      (control: original MATH)"
-echo "          ${MODEL_SLUG}__sft_skill         (Skill_MATH)"
-echo ""
-echo "Stage 2:  ${MODEL_SLUG}__simple_replay"
+echo "Stage 2:  ${MODEL_SLUG}__sft_skill         (Skill_MATH)"
+echo "Stage 4:  ${MODEL_SLUG}__simple_replay"
 echo "          ${MODEL_SLUG}__sem_replay"
 echo "          ${MODEL_SLUG}__num_replay"
 echo "          ${MODEL_SLUG}__both_replay"
-echo ""
-echo "Stage 3:  ${MODEL_SLUG}__grpo_sft_original"
-echo "          ${MODEL_SLUG}__grpo_sft_skill"
+echo "Stage 5:  ${MODEL_SLUG}__grpo_sft_skill"
 echo "          ${MODEL_SLUG}__grpo_simple_replay"
 echo "          ${MODEL_SLUG}__grpo_sem_replay"
 echo "          ${MODEL_SLUG}__grpo_num_replay"
 echo "          ${MODEL_SLUG}__grpo_both_replay"
 echo ""
-echo "Total evaluation runs: 13  (1 baseline + 6 SFT + 6 GRPO)"
-echo "Checkpoint evaluations: DISABLED (commented out)"
+echo "Total evaluation runs: 12  (1 baseline + 6 SFT + 5 GRPO)"
+echo "Checkpoint evaluations: none (end evaluation only)"
 echo ""
 echo "Ledger:  $LEDGER"
 echo "Report:  outputs/report/"
+echo "HF SFT:      https://huggingface.co/$SMART_HF_SFT_REPO"
+echo "HF Replay:   https://huggingface.co/$SMART_HF_REPLAY_REPO"
+echo "HF GRPO:     https://huggingface.co/$SMART_HF_GRPO_REPO"
+echo "HF Outputs:  https://huggingface.co/datasets/$SMART_HF_OUTPUTS_REPO"
 echo "======================================================================"
