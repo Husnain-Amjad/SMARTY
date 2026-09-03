@@ -69,7 +69,7 @@ export SMART_HF_SFT_REPO="${SMART_HF_SFT_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_SFT
 export SMART_HF_REPLAY_REPO="${SMART_HF_REPLAY_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_Replay_SFT}"
 export SMART_HF_GRPO_REPO="${SMART_HF_GRPO_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_GRPO}"
 export SMART_HF_OUTPUTS_REPO="${SMART_HF_OUTPUTS_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_Outputs}"
-export HF_TOKEN="hf_xxxxxxxxxxxxxxxx"
+
 if [ -z "${HF_TOKEN:-}" ] && [ -z "${SMART_HF_DISABLE:-}" ]; then
     echo "[HF] WARNING: HF_TOKEN is not set. Uploads will fail."
     echo "     The experiment itself will continue and artifacts remain local."
