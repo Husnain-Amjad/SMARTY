@@ -74,61 +74,52 @@ def recommended_batch_size(gpu_memory_gb: float, backend: str = "vllm") -> int:
 
 def select_attn_implementation(prefer_flash: bool = True) -> str:
     """
-    Returns the best available attn_implementation string for
-    AutoModelForCausalLM.from_pretrained(), preferring flash-attention when
-    both (a) the flash_attn package is actually importable, not just
-    architecturally plausible, and (b) the GPU supports it (compute
-    capability >= 8.0, i.e. Ampere or newer - Hopper/H100 and Blackwell get
-    the same "flash_attention_2" string from transformers either way; the
-    installed flash-attn package's own build (2.x vs a 3.x/Hopper-optimized
-    build) determines which kernels actually run underneath that string).
+    Returns "flash_attention_2" unconditionally.
 
-    Falls back to "sdpa" (portable across CUDA and ROCm, and the only option
-    at all on ROCm since the flash-attn pip package is CUDA-only) otherwise.
-    This is a static/heuristic check - pair with load_model_with_best_attention()
-    below for a runtime fallback too, in case this misses an edge case (e.g.
-    flash-attn installed but incompatible with a specific model architecture).
+    This pipeline targets NVIDIA CUDA GPUs (Ampere-class or newer) where
+    flash-attention-2 is both available and the intended kernel, so attention
+    selection is fixed rather than auto-negotiated. Auto-fallback to sdpa was
+    removed deliberately: a silent downgrade meant training runs could differ
+    in kernel between machines without that being visible in any log or config,
+    which is exactly the kind of hidden variation that makes results hard to
+    reproduce.
+
+    If flash-attn is genuinely unavailable, the model load will now FAIL
+    LOUDLY with the underlying error rather than quietly proceeding on a
+    different kernel - install it with:
+        pip install flash-attn --no-build-isolation
+    (requires compute capability >= 8.0; see setup_environment.sh)
     """
-    if not prefer_flash:
-        return "sdpa"
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            return "sdpa"
-        if getattr(torch.version, "hip", None):
-            return "sdpa"  # flash-attn pip package is CUDA-only; sdpa already
-                            # gets the AOTriton fast path on ROCm
-        import importlib.util
-        if importlib.util.find_spec("flash_attn") is None:
-            return "sdpa"  # architecturally eligible but not actually installed
-        major, _ = torch.cuda.get_device_capability(0)
-        if major < 8:
-            return "sdpa"  # pre-Ampere - flash-attn unreliable/unsupported here
-        return "flash_attention_2"
-    except Exception:
-        return "sdpa"
+    return "flash_attention_2"
 
 
 def load_model_with_best_attention(model_class, model_name_or_path, **kwargs):
     """
-    Loads a model with the best statically-detected attention implementation,
-    and falls back to sdpa at RUNTIME if that load actually fails (e.g.
-    flash-attn installed but incompatible with this specific model
-    architecture, or a version mismatch static detection can't see).
-    Returns (model, attn_impl_actually_used).
+    Loads a model with flash_attention_2. Returns (model, attn_impl_used).
+
+    There is deliberately NO sdpa fallback here. Silently retrying on a
+    different attention kernel would mean two runs of the "same" config could
+    use different kernels with nothing in the logs or training_config.json to
+    record it. If flash-attn is missing or incompatible, this raises so the
+    problem is fixed once rather than absorbed into every subsequent result.
     """
     attn_impl = select_attn_implementation()
     try:
-        model = model_class.from_pretrained(model_name_or_path, attn_implementation=attn_impl, **kwargs)
-        print(f"[hardware_utils] loaded {model_name_or_path} with attn_implementation={attn_impl}")
-        return model, attn_impl
+        model = model_class.from_pretrained(model_name_or_path,
+                                            attn_implementation=attn_impl, **kwargs)
     except Exception as e:
-        if attn_impl == "sdpa":
-            raise  # already the fallback - nothing else to try
-        print(f"[hardware_utils] {attn_impl} load failed ({type(e).__name__}: {e}) - "
-              f"falling back to sdpa")
-        model = model_class.from_pretrained(model_name_or_path, attn_implementation="sdpa", **kwargs)
-        return model, "sdpa"
+        raise RuntimeError(
+            f"[hardware_utils] failed to load '{model_name_or_path}' with "
+            f"attn_implementation={attn_impl}: {type(e).__name__}: {e}\n"
+            f"This pipeline requires flash-attention-2 (no sdpa fallback, by design - "
+            f"see select_attn_implementation). Install it with:\n"
+            f"    pip install flash-attn --no-build-isolation\n"
+            f"It needs compute capability >= 8.0 (Ampere/A100 or newer) and can take "
+            f"a long time to compile if no prebuilt wheel matches your exact "
+            f"torch/CUDA/Python combination. setup_environment.sh installs it."
+        ) from e
+    print(f"[hardware_utils] loaded {model_name_or_path} with attn_implementation={attn_impl}")
+    return model, attn_impl
 
 
 def _try_run(cmd):

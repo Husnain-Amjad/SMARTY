@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Training / experiment artifacts (regenerated, not source)
+outputs/
+ckpts/
+restored/
+restored_outputs/
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+
+# Datasets pulled at runtime
+data/*.jsonl
+data/*.csv
+!data/skill_labels.jsonl.example
+
+# Logs / caches
+wandb/
+*.log
+.cache/
+.ipynb_checkpoints/
+.hf_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets - never commit
+.env
+*.pem
+*.key

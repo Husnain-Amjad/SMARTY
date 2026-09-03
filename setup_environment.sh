@@ -49,15 +49,19 @@ if ! grep -q "HF_HUB_DISABLE_XET" ~/.bashrc 2>/dev/null; then
 fi
 
 echo ""
-echo "=== Optional: flash-attention (Ampere/A100 or newer only) ==="
-echo "This step can take a long time to compile if no prebuilt wheel matches"
-echo "your exact torch/CUDA/Python version - that is expected, not a hang."
-echo "It is OPTIONAL: the pipeline automatically falls back to sdpa (still fast"
-echo "on Ampere+) if this is skipped or fails - see hardware_utils.py."
-pip install --break-system-packages flash-attn --no-build-isolation || \
-    echo "flash-attn install failed or was skipped - continuing without it (sdpa fallback will be used automatically)"
-
+echo "=== Step 5: flash-attention-2 (REQUIRED) ==="
+echo "This pipeline forces attn_implementation=flash_attention_2 for SFT and GRPO."
+echo "There is NO sdpa fallback - a silent kernel downgrade would mean two runs of"
+echo "the same config could differ with nothing recording it. If this install fails,"
+echo "training will fail loudly rather than quietly using a different kernel."
 echo ""
+echo "Requires compute capability >= 8.0 (Ampere/A100 or newer). Compilation can"
+echo "take a long time when no prebuilt wheel matches your exact torch/CUDA/Python"
+echo "combination - that is expected, not a hang. Installing ninja first helps."
+pip install --break-system-packages ninja
+pip install --break-system-packages flash-attn --no-build-isolation
+python3 -c "import flash_attn; print('flash-attn', flash_attn.__version__, 'OK')"
+
 echo "=== Final verification ==="
 python3 -c "import torch; print('torch', torch.__version__, 'cuda available:', torch.cuda.is_available())"
 python3 -c "import vllm; print('vllm', vllm.__version__)"

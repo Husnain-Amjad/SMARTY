@@ -293,7 +293,20 @@ def evaluate_run(predictions_path: str, out_detailed_path: str, out_summary_path
                   base_split: str = "train", skill_repo: str = DEFAULT_SKILL_REPO,
                   skill_labels_file: str = None, fuzzy_threshold: float = 0.8):
     predictions_path = str(require_input_path(predictions_path))
-    base_labels = load_skill_labels(base_split, repo_id=skill_repo, local_path=skill_labels_file)
+    # Skill labels exist ONLY for the Skill_MATH train split. The test split in
+    # this project is the ORIGINAL Hendrycks MATH test set, which has no skill
+    # annotations and never will - so don't even attempt the lookup for it.
+    # Previously this contacted the Hub, failed to find a 'test' split, and
+    # printed a confusing warning on every single evaluation.
+    if base_split == "test" and not skill_labels_file:
+        print("[evaluate_run] split='test' -> original Hendrycks MATH, which carries no "
+              "skill annotations. Skipping the skill-label lookup entirely. "
+              "final_correct, format_compliance and arithmetic-consistency are all "
+              "computed normally; skill-prediction/skill-usage are reported as N/A.")
+        base_labels = {}
+    else:
+        base_labels = load_skill_labels(base_split, repo_id=skill_repo,
+                                        local_path=skill_labels_file)
 
     detailed = []
     n_with_ref = 0

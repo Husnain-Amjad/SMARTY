@@ -127,7 +127,7 @@ def load_skill_labels(split: str = "train", repo_id: str = DEFAULT_SKILL_REPO,
         if "Unknown split" not in str(e):
             raise
         # This is expected and permanent for split="test": the skill-label
-        # repo currently only has train-split labels (see label_test_create.py
+        # repo only has train-split labels; the test split in this project is
         # if you need test-split coverage). Returning empty labels here lets
         # evaluator.py's own "0% coverage" handling take over cleanly instead
         # of crashing before it gets the chance - final-answer accuracy and
@@ -136,14 +136,60 @@ def load_skill_labels(split: str = "train", repo_id: str = DEFAULT_SKILL_REPO,
         print(f"[load_skill_labels] '{repo_id}' has no split='{split}' ({e}) - "
               f"returning 0 skill labels for this split. Skill-prediction/skill-usage "
               f"metrics will show 0% coverage; final-answer accuracy and arithmetic-"
-              f"consistency are unaffected. Run label_test_create.py if you need "
-              f"test-split skill coverage.")
+              f"consistency are unaffected. The test split is the original Hendrycks "
+              f"MATH set, which carries no skill annotations by design.")
         return labels
     for row in ds:
         row = dict(row)
         labels[_hash_problem(row["problem"])] = row
     print(f"[load_skill_labels] loaded {len(labels)} rows from hf://{repo_id} (split={split})")
     return labels
+
+
+def build_original_sft_dataset(out_path: str, split: str = "train", limit: int = None):
+    """
+    Builds SFT examples from the ORIGINAL Hendrycks MATH dataset only - no
+    skill labels, no [SKILL: ...] tags, no `Relevant skills:` header.
+
+    This is the control condition for the whole study. Comparing it against the
+    skill-labeled build isolates the contribution of skill supervision itself,
+    separately from the contribution of simply doing more supervised
+    fine-tuning on math data. Without this arm, any gain from the skill-labeled
+    build is confounded with "trained longer on MATH".
+
+    The `think` field carries the reference solution as plain reasoning, so the
+    rendered target is structurally the same shape (<think>/<solution>) and the
+    only difference is the absence of skill supervision.
+    """
+    rows = load_hendrycks_math(split)
+    if limit:
+        rows = rows[:limit]
+
+    examples = []
+    for row in rows:
+        gold = extract_boxed(row["solution"])
+        if not gold:
+            continue
+        examples.append({
+            "problem_id": row["problem_id"],
+            "subject": row["subject"],
+            "level": row.get("level", "unknown"),
+            "problem": row["problem"],
+            "think": strip_trailing_answer_line(row["solution"]),
+            "solution": row["solution"],
+            "gold_boxed": gold,
+            "n_skills": 0,
+            "skills": "",
+            "source": "hendrycks_math_original",
+        })
+
+    ensure_output_path(out_path)
+    with open(out_path, "w") as f:
+        for ex in examples:
+            f.write(json.dumps(ex) + "\n")
+    print(f"[build-sft-original] wrote {len(examples)} examples from the ORIGINAL "
+          f"Hendrycks MATH {split} split (no skill labels) -> {out_path}")
+    return examples
 
 
 def build_sft_dataset(out_path: str, split: str = "train",
@@ -502,6 +548,10 @@ def generate_multi_solutions(weak_report: list, math_rows: list, batch_sampler_f
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--build-sft", action="store_true")
+    ap.add_argument("--build-sft-original", action="store_true",
+                     help="build SFT data from the ORIGINAL Hendrycks MATH train split "
+                          "(no skill labels) - the control arm that isolates the effect "
+                          "of skill supervision from that of extra SFT on math data.")
     ap.add_argument("--diagnose", action="store_true")
     ap.add_argument("--augment-semantic", action="store_true")
     ap.add_argument("--augment-numeric", action="store_true")
@@ -511,6 +561,8 @@ if __name__ == "__main__":
                      help="Hugging Face Hub dataset repo id for skill labels")
     ap.add_argument("--skill-labels-file", type=str, default=None,
                      help="optional local jsonl/csv override instead of --skill-repo")
+    ap.add_argument("--limit_source", type=int, default=None,
+                     help="cap how many source problems are used (smoke testing).")
     ap.add_argument("--no-unlabeled-fallback", action="store_true", default=False,
                      help="skip topping up with plain hendrycks_math rows for problems "
                           "not in your skill-label file. Useful for a quick local-only "
@@ -524,7 +576,10 @@ if __name__ == "__main__":
 
     args = ap.parse_args()
 
-    if args.build_sft:
+    if args.build_sft_original:
+        build_original_sft_dataset(args.out, split=args.split, limit=args.limit_source)
+
+    elif args.build_sft:
         build_sft_dataset(
             out_path=args.out,
             split=args.split,

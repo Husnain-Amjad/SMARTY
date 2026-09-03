@@ -38,12 +38,14 @@ markdown>=3.6
 torchao>=0.1.6
 antlr4-python3-runtime==4.11  # exact pin: required by sympy's latex parser, known-fragile across versions
 
-# ---- Optional (skipped automatically with no loss of correctness if
-# unavailable - see hardware_utils.py's automatic sdpa fallback) ----
+# ---- REQUIRED: flash-attention-2 ----
+#   pip install ninja                                  # speeds up the build
 #   pip install flash-attn --no-build-isolation
-# Requires compute capability >= 8.0 (Ampere/A100 or newer). Can take a long
-# time to compile if no prebuilt wheel matches your exact torch/CUDA/Python
-# combination - that is expected, not a hang.
+# SFT and GRPO force attn_implementation=flash_attention_2 with NO sdpa
+# fallback, so this is mandatory rather than optional. Requires compute
+# capability >= 8.0 (Ampere/A100 or newer). Compilation can take a long time
+# if no prebuilt wheel matches your exact torch/CUDA/Python combination -
+# expected, not a hang.
 
 # ---- Optional, only if using --use_bnb 4-bit QLoRA ----
 #   pip install bitsandbytes

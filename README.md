@@ -260,8 +260,9 @@ Flat, no nested docs folder — the only subdirectories are functional
 | `run_full_experiment.sh` | The full experiment ladder (baseline → SFT → 3 augmentation variants → 4 GRPO variants) for one model, with per-model output/ledger namespacing and per-checkpoint logging |
 | `run_all_models.sh` | Runs every target model in sequence, then generates the combined report |
 | `run_0N_<model>.sh` | Thin, ready-to-run wrapper scripts, one per target model |
-| `create_test_skill_labels.sh` | Bash wrapper for `label_test_set_v2.py`, saves to `data/test_skill_labels.jsonl` |
 | `data_pipeline.py` | Builds the SFT dataset from skill-labeled data; diagnoses weak clusters; runs semantic/numeric perturbation and multi-solution rejection sampling |
+| `hf_sync.py` | Pushes checkpoints to model repos (routed by family) and all artifacts to one dataset repo; pulls either back for later evaluation |
+| `hyperparameter_search.py` | Grid search on a held-out validation subset carved from train |
 | `templates.py` | Renders raw `{problem, think, solution}` rows into each model's own prompt format at train/eval time |
 | `reward_fn.py` | Boxed-answer extraction and symbolic-equivalence checking |
 | `determinism.py` | Seeds random/numpy/torch/transformers consistently |
@@ -276,10 +277,6 @@ Flat, no nested docs folder — the only subdirectories are functional
 | `evaluator.py` | Scores predictions on 4 metric families; cross-run ablation comparison with significance flags |
 | `dump_model_template.py` | Inspects a model's real tokenizer/chat-template before you train on it |
 | `hyperparameter_search.py` | Small, documented grid search on held-out validation data — replaces ad-hoc tuning with a citable methodology |
-| `label_test_create.py` | Lighter-weight test-split skill labeling, hard-constrained to the train vocabulary |
-| `label_test_set.py` | 3-pass test-split labeling with an independent judge model |
-| `label_test_set_v2.py` | Recommended test-set labeling: one-shot example, judge model, fixer model, semantic canonicalization — matches training-data format exactly |
-| `format_test_labels.py` | Repairs/reformats an already-generated test-set skill-label file |
 | `generate_all_reports.py` | One command for all diagrams + all ledger-derived tables + all figures together |
 | `experiment_ledger.py` | Append-only log of every run: full config + results + increment vs. baseline |
 | `generate_tables.py` | Ledger → LaTeX (booktabs) + Markdown tables |
@@ -320,6 +317,6 @@ Flat, no nested docs folder — the only subdirectories are functional
 | vLLM fails with `FlashInfer requires GPUs with smXX or higher` despite a newer card | A known false positive on some Blackwell-generation GPUs — set `VLLM_USE_FLASHINFER_SAMPLER=0` rather than reinstalling anything |
 | `flash-attn` install hangs or fails | Not required — `sdpa` is the automatic fallback and is already fast on Ampere/A100 and newer. Skip it, or install `ninja` first if you specifically want it |
 | Segfault or hang inside `xet_get`/`hf_hub_download` during a model download, especially under parallel/concurrent downloads | Known bug in Hugging Face's `hf-xet` download backend — `setup_environment.sh` already removes it and disables it by default; if you still hit this, run `pip uninstall -y hf-xet && export HF_HUB_DISABLE_XET=1` manually (the env var alone is reported unreliable in some versions — remove the package too) |
-| `evaluator.py`'s skill metrics show near-zero coverage on the test split | Skill labels only cover whatever split you point `--skill-repo`/`--skill-labels-file` at — run `create_test_skill_labels.sh` to extend coverage to test |
+| `evaluator.py` reports skill metrics as N/A on the test split | Expected and by design. The test split is the original Hendrycks MATH set, which carries no skill annotations. Final-answer accuracy, format compliance and arithmetic consistency are all computed normally |
 | Results differ across machines with the same seed | Expected — floating-point reduction order in matmul/attention kernels differs across GPUs/drivers regardless of seed |
 | A run's ledger comparison shows a small, possibly-noise improvement | Check it against standard error: roughly `sqrt(p*(1-p)/n)` for a cluster with `n` problems — `evaluator.py --compare` flags this automatically |

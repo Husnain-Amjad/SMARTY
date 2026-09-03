@@ -56,8 +56,9 @@ split. Metrics depending on `S*` are therefore `None` per-example on the test
 split, excluded from aggregates, and reported with an explicit coverage
 percentage rather than silently averaged to a misleading value. Final-answer
 correctness and the arithmetic-consistency proxy do not depend on `S*` and
-remain valid on any split. `label_test_set_v2.py` extends `S*` to the test
-split when held-out skill evaluation is required.
+remain valid on any split. The test split in this project is the ORIGINAL
+Hendrycks MATH test set, which carries no skill annotations by design, so
+metrics 3 and 4 are reported as N/A there rather than estimated.
 
 ---
 
