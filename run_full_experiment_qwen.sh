@@ -101,7 +101,7 @@ fi
 # ============================================================================
 # TRAINING SETTINGS
 # ============================================================================
-EPOCHS="${EPOCHS:-1}"
+EPOCHS="${EPOCHS:-4}"
 SAVE_EVERY_EPOCHS="${SAVE_EVERY_EPOCHS:-1}"
 PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
@@ -109,7 +109,7 @@ LORA_R="${LORA_R:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
 REPLAY_RATIO="${REPLAY_RATIO:-0.7}"
 REPLAY_MODE="${REPLAY_MODE:-additive}"
-GRPO_EPOCHS="${GRPO_EPOCHS:-1}"
+GRPO_EPOCHS="${GRPO_EPOCHS:-4}"
 GRPO_GENERATIONS="${GRPO_GENERATIONS:-4}"
 
 # ============================================================================
