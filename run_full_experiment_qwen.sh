@@ -1,684 +1,1211 @@
-
 #!/usr/bin/env bash
-# ============================================================================
-# run_full_experiment.sh - SMART experiment ladder
+
+# ============================================================
+# SMARTY - Qwen 2.5-Math-7B-Instruct Full Experiment Pipeline
 #
-#   Stage 0 : Baseline (untrained)
-#   Stage 1 : SFT on Skill_MATH
-#   Stage 2 : Diagnosis + augmentation generation (semantic + numeric)
-#   Stage 3 : SFT + simple replay          (Skill_MATH)
-#             SFT + semantic replay        (Skill_MATH + semantic aug)
-#             SFT + numeric replay         (Skill_MATH + numeric aug)
-#             SFT + both replay            (Skill_MATH + semantic + numeric aug)
-#   Stage 4 : GRPO on each of the five Skill_MATH SFT models
+# Model:
+#   Qwen/Qwen2.5-Math-7B-Instruct
 #
-#   Total: 10 evaluation runs
-#     1 baseline
-#     1 Skill_MATH SFT
-#     4 replay SFT
-#     5 GRPO
+# Pipeline:
+#   Stage 0: Baseline
+#   Stage 1: Skill-aware SFT
+#   Stage 2: Diagnosis + Augmentation
+#   Stage 3: Progressive Replay SFT + GRPO
 #
-# NOTES
-#   - Training (SFT/GRPO) always uses flash-attention-2. No SDPA fallback.
-#   - All inference/evaluation uses vLLM via --use_vllm.
-#   - Only END evaluation per stage. Per-checkpoint evaluation is NOT part of
-#     this script.
-#   - The TEST split is the ORIGINAL Hendrycks MATH test set.
-#   - The test set carries no skill annotations, so skill-prediction/skill-usage
-#     report N/A there; final-answer accuracy, format compliance and arithmetic
-#     consistency are computed normally.
+# Progressive storage strategy:
+#   SFT -> Eval -> GRPO -> Eval -> HF Push -> Cleanup
 #
-# HUGGING FACE
-#   Token must come from the environment:
-#       export HF_TOKEN=hf_xxxxxxxx
-#   Set SMART_HF_DISABLE=1 to skip all uploads.
+# This avoids keeping all SFT + GRPO checkpoints locally.
 #
 # Usage:
-#   ./run_full_experiment.sh <MODEL> [TRAIN_N] [TEST_N]
+#   bash run_full_experiment_qwen.sh
 #
-# Examples:
-#   ./run_full_experiment.sh Qwen/Qwen2.5-Math-7B-Instruct
-#   ./run_full_experiment.sh Qwen/Qwen2.5-Math-7B-Instruct 60 500
-# ============================================================================
+# Optional:
+#   bash run_full_experiment_qwen.sh 20 20
+#
+# Environment:
+#   HF_TOKEN must be set unless SMART_HF_DISABLE=1
+#
+# ============================================================
 
 set -Eeuo pipefail
 
-trap 'echo ""; echo "[ERROR] Pipeline failed at line $LINENO"; echo "[ERROR] Command: $BASH_COMMAND"; exit 1' ERR
+trap '
+    echo ""
+    echo "============================================================"
+    echo "[ERROR] Pipeline failed at line $LINENO"
+    echo "[ERROR] Command: $BASH_COMMAND"
+    echo "============================================================"
+    exit 1
+' ERR
 
-# ============================================================================
-# ARGUMENTS
-# ============================================================================
 
-MODEL="${1:?Usage: ./run_full_experiment.sh <MODEL> [TRAIN_N] [TEST_N]}"
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+MODEL="${1:-Qwen/Qwen2.5-Math-7B-Instruct}"
 TRAIN_N="${2:-full}"
 TEST_N="${3:-full}"
 
-MODEL_SLUG="$(echo "$MODEL" | tr '/' '_')"
+MODEL_SLUG="Qwen_2.5_Math_7b"
+
 OUT="outputs/${MODEL_SLUG}"
 CKPT="ckpts/${MODEL_SLUG}"
+
 LEDGER="outputs/experiment_ledger.jsonl"
 
-mkdir -p "$OUT" "$CKPT"
 
-# ============================================================================
-# HUGGING FACE REPOSITORIES
-# Token is read from HF_TOKEN in the environment - never hardcode it here.
-# ============================================================================
+# ------------------------------------------------------------
+# Hugging Face repositories
+# ------------------------------------------------------------
 
-export SMART_HF_SFT_REPO="${SMART_HF_SFT_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_SFT}"
-export SMART_HF_REPLAY_REPO="${SMART_HF_REPLAY_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_Replay_SFT}"
-export SMART_HF_GRPO_REPO="${SMART_HF_GRPO_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_GRPO}"
-export SMART_HF_OUTPUTS_REPO="${SMART_HF_OUTPUTS_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_Outputs}"
+SMART_HF_SFT_REPO="${SMART_HF_SFT_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_SFT}"
+SMART_HF_REPLAY_REPO="${SMART_HF_REPLAY_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_Replay_SFT}"
+SMART_HF_GRPO_REPO="${SMART_HF_GRPO_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_GRPO}"
+SMART_HF_OUTPUTS_REPO="${SMART_HF_OUTPUTS_REPO:-HusnainAmjad/Qwen_2.5_Math_7b_Outputs}"
 
-if [ -z "${HF_TOKEN:-}" ] && [ -z "${SMART_HF_DISABLE:-}" ]; then
-    echo "[HF] WARNING: HF_TOKEN is not set. Uploads will fail."
-    echo "     The experiment itself will continue and artifacts remain local."
-    echo "     Either:"
-    echo "       export HF_TOKEN=hf_xxxxxxxxxxxxxxxx"
-    echo "       export SMART_HF_DISABLE=1"
-fi
 
-# ============================================================================
-# TRAINING SETTINGS
-# ============================================================================
+# ------------------------------------------------------------
+# HF cleanup behaviour
+#
+# Normal:
+#   HF_TOKEN must exist.
+#   Successful uploads permit local cleanup.
+#
+# Disable:
+#   SMART_HF_DISABLE=1
+#   Nothing is deleted because HF is not being used as archive.
+# ------------------------------------------------------------
 
-EPOCHS="${EPOCHS:-1}"
-SAVE_EVERY_EPOCHS="${SAVE_EVERY_EPOCHS:-1}"
-PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-4}"
-GRAD_ACCUM="${GRAD_ACCUM:-2}"
+SMART_HF_DISABLE="${SMART_HF_DISABLE:-0}"
+
+
+# ------------------------------------------------------------
+# Training configuration
+# ------------------------------------------------------------
 
 LORA_R="${LORA_R:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
 
+EPOCHS="${EPOCHS:-4}"
+
+SAVE_EVERY_EPOCHS="${SAVE_EVERY_EPOCHS:-1}"
+
+PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-32}"
+GRAD_ACCUM="${GRAD_ACCUM:-1}"
+
 REPLAY_RATIO="${REPLAY_RATIO:-0.7}"
-REPLAY_MODE="${REPLAY_MODE:-additive}"
 
-GRPO_EPOCHS="${GRPO_EPOCHS:-1}"
-GRPO_GENERATIONS="${GRPO_GENERATIONS:-4}"
 
-# ============================================================================
-# vLLM SETTINGS
-# ============================================================================
+# ------------------------------------------------------------
+# GRPO configuration
+# ------------------------------------------------------------
 
-VLLM_GPU_MEMORY="${VLLM_GPU_MEMORY:-0.90}"
-VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-4096}"
-VLLM_TENSOR_PARALLEL="${VLLM_TENSOR_PARALLEL:-1}"
-VLLM_MAX_TOKENS="${VLLM_MAX_TOKENS:-2048}"
+GRPO_W_CORRECTNESS="${GRPO_W_CORRECTNESS:-1.0}"
+GRPO_W_FORMAT="${GRPO_W_FORMAT:-0.2}"
+GRPO_W_PERSISTENCE="${GRPO_W_PERSISTENCE:-0.15}"
+GRPO_W_CHAIN_STABILITY="${GRPO_W_CHAIN_STABILITY:-0.25}"
 
-# ============================================================================
-# LIMITS
-# ============================================================================
 
-if [ "$TEST_N" = "full" ]; then
-    LIMIT_ARG=()
-else
-    LIMIT_ARG=(--limit "$TEST_N")
-fi
+# ------------------------------------------------------------
+# Evaluation
+# ------------------------------------------------------------
 
-if [ "$TRAIN_N" = "full" ]; then
-    AUG_SOURCE_ARG=()
-else
-    AUG_SOURCE_ARG=(--limit_source "$TRAIN_N")
-fi
+MAX_TOKENS="${MAX_TOKENS:-1024}"
 
-# ============================================================================
-# HEADER
-# ============================================================================
+# vLLM is used by evaluation.
+USE_VLLM="${USE_VLLM:-1}"
 
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+echo ""
 echo "============================================================"
-echo "SMART EXPERIMENT LADDER"
+echo " SMARTY - QWEN FULL EXPERIMENT"
 echo "============================================================"
-echo "MODEL:                 $MODEL"
-echo "MODEL_SLUG:            $MODEL_SLUG"
-echo "TRAIN_N:               $TRAIN_N"
-echo "TEST_N:                $TEST_N"
-echo "OUTPUTS:               $OUT"
-echo "CHECKPOINTS:           $CKPT"
-echo "LEDGER:                $LEDGER"
-echo "ATTENTION:             flash_attention_2 (forced, no sdpa)"
-echo "INFERENCE:             vLLM"
-echo "CHECKPOINT EVAL:       none (end evaluation only)"
-echo "SFT EPOCHS:            $EPOCHS"
-echo "GRPO EPOCHS:           $GRPO_EPOCHS"
-echo "REPLAY MODE:           $REPLAY_MODE (ratio $REPLAY_RATIO)"
-echo "vLLM GPU UTILIZATION:  $VLLM_GPU_MEMORY"
-echo "vLLM MAX MODEL LEN:    $VLLM_MAX_MODEL_LEN"
-echo "vLLM TP:               $VLLM_TENSOR_PARALLEL"
-echo "vLLM MAX TOKENS:       $VLLM_MAX_TOKENS"
-echo "------------------------------------------------------------"
-echo "HF SFT REPO:           $SMART_HF_SFT_REPO"
-echo "HF REPLAY REPO:        $SMART_HF_REPLAY_REPO"
-echo "HF GRPO REPO:          $SMART_HF_GRPO_REPO"
-echo "HF OUTPUTS DATASET:    $SMART_HF_OUTPUTS_REPO"
-echo "HF TOKEN:              ${HF_TOKEN:+set}${HF_TOKEN:-NOT SET}"
-echo "HF UPLOADS:            ${SMART_HF_DISABLE:+DISABLED}${SMART_HF_DISABLE:-enabled}"
+echo "Model              : ${MODEL}"
+echo "Train size         : ${TRAIN_N}"
+echo "Test size          : ${TEST_N}"
+echo "Output directory   : ${OUT}"
+echo "Checkpoint dir     : ${CKPT}"
+echo ""
+echo "SFT HF repo        : ${SMART_HF_SFT_REPO}"
+echo "Replay HF repo     : ${SMART_HF_REPLAY_REPO}"
+echo "GRPO HF repo       : ${SMART_HF_GRPO_REPO}"
+echo "Outputs HF repo    : ${SMART_HF_OUTPUTS_REPO}"
 echo "============================================================"
+echo ""
 
-# ============================================================================
-# HELPERS
-# ============================================================================
 
-run_vllm_eval() {
-    local MODEL_PATH="$1"
-    local OUTPUT_PATH="$2"
+if [ "${SMART_HF_DISABLE}" != "1" ]; then
 
-    echo ""
-    echo "----------------------------------------------------------------------"
-    echo "vLLM EVALUATION  |  model: $MODEL_PATH"
-    echo "----------------------------------------------------------------------"
-
-    python run_eval.py \
-        --model "$MODEL_PATH" \
-        --split test \
-        "${LIMIT_ARG[@]}" \
-        --use_vllm \
-        --gpu_memory_utilization "$VLLM_GPU_MEMORY" \
-        --max_model_len "$VLLM_MAX_MODEL_LEN" \
-        --tensor_parallel_size "$VLLM_TENSOR_PARALLEL" \
-        --max_tokens "$VLLM_MAX_TOKENS" \
-        --out "$OUTPUT_PATH"
-
-    echo "[OK] vLLM evaluation completed."
-}
-
-run_score() {
-    local PREDICTIONS="$1"
-    local DETAILED="$2"
-    local SUMMARY="$3"
-
-    echo ""
-    echo "----------------------------------------------------------------------"
-    echo "SCORING  |  $PREDICTIONS"
-    echo "----------------------------------------------------------------------"
-
-    python evaluator.py \
-        --score \
-        --predictions "$PREDICTIONS" \
-        --split test \
-        --out-detailed "$DETAILED" \
-        --out-summary "$SUMMARY"
-
-    echo "[OK] Scoring completed."
-}
-
-run_log() {
-    local RUN_ID="$1"
-    local CONFIG="$2"
-    local SUMMARY="$3"
-    local BASELINE="$4"
-    local NOTES="$5"
-
-    echo ""
-    echo "----------------------------------------------------------------------"
-    echo "LEDGER  |  $RUN_ID"
-    echo "----------------------------------------------------------------------"
-
-    if [ -n "$BASELINE" ]; then
-        python experiment_ledger.py --log \
-            --run_id "$RUN_ID" \
-            --training_config "$CONFIG" \
-            --eval_summary "$SUMMARY" \
-            --ledger "$LEDGER" \
-            --baseline_run_id "$BASELINE" \
-            --notes "$NOTES"
-    else
-        python experiment_ledger.py --log \
-            --run_id "$RUN_ID" \
-            --training_config "$CONFIG" \
-            --eval_summary "$SUMMARY" \
-            --ledger "$LEDGER" \
-            --notes "$NOTES"
+    if [ -z "${HF_TOKEN:-}" ]; then
+        echo "[HF] ERROR: HF_TOKEN is not set."
+        echo ""
+        echo "HF upload is required for progressive cleanup."
+        echo ""
+        echo "Set it before running:"
+        echo '  export HF_TOKEN="hf_..."'
+        echo ""
+        echo "Or explicitly disable HF cleanup:"
+        echo '  export SMART_HF_DISABLE=1'
+        echo ""
+        exit 1
     fi
 
-    echo "[OK] Ledger entry completed."
+    echo "[HF] Token: set"
+
+else
+
+    echo "[HF] Upload/cleanup: DISABLED"
+    echo "[HF] Local checkpoints will NOT be deleted."
+
+fi
+
+
+# ============================================================
+# DIRECTORY SETUP
+# ============================================================
+
+mkdir -p "${OUT}"
+mkdir -p "${CKPT}"
+mkdir -p "$(dirname "${LEDGER}")"
+
+
+# ============================================================
+# DISK MONITOR
+# ============================================================
+
+check_disk() {
+
+    echo ""
+    echo "------------------------------------------------------------"
+    echo "[DISK] Current usage"
+    echo "------------------------------------------------------------"
+
+    df -h .
+
+    echo ""
+    echo "[DISK] Checkpoints:"
+    du -sh "${CKPT}" 2>/dev/null || true
+
+    echo ""
+    echo "[DISK] Outputs:"
+    du -sh "${OUT}" 2>/dev/null || true
+
+    echo ""
 }
 
-# Push a merged checkpoint.
-# A failed upload must not destroy a completed training run.
+
+# ============================================================
+# HF UPLOAD STATUS
+# ============================================================
+
+declare -A PUSH_OK
+
+
+# ============================================================
+# HF MODEL PUSH
+# ============================================================
 
 push_model_hf() {
-    local LOCAL_DIR="$1"
+
+    local MODEL_PATH="$1"
     local VARIANT="$2"
 
-    if [ -n "${SMART_HF_DISABLE:-}" ]; then
+    echo ""
+    echo "============================================================"
+    echo "[HF] Uploading model"
+    echo "============================================================"
+    echo "Variant : ${VARIANT}"
+    echo "Path    : ${MODEL_PATH}"
+    echo "============================================================"
+
+    if [ "${SMART_HF_DISABLE}" = "1" ]; then
+
+        echo "[HF] Disabled."
+        PUSH_OK["${VARIANT}"]="no"
+
+        return 0
+    fi
+
+
+    if python hf_sync.py \
+        --push-model "${MODEL_PATH}" \
+        --variant "${VARIANT}"
+    then
+
+        echo "[HF] Upload SUCCESS: ${VARIANT}"
+
+        PUSH_OK["${VARIANT}"]="yes"
+
+    else
+
+        echo "[HF] Upload FAILED: ${VARIANT}"
+
+        PUSH_OK["${VARIANT}"]="no"
+
+        return 1
+    fi
+}
+
+
+# ============================================================
+# HF OUTPUT PUSH
+# ============================================================
+
+push_outputs_hf() {
+
+    if [ "${SMART_HF_DISABLE}" = "1" ]; then
+        echo "[HF] Output upload disabled."
         return 0
     fi
 
     echo ""
-    echo "[HF] pushing $VARIANT -> Hub"
-
-    python hf_sync.py --push-model \
-        --local "$LOCAL_DIR" \
-        --model-slug "$MODEL_SLUG" \
-        --variant "$VARIANT" \
-        || echo "[HF] WARNING: push of $VARIANT failed - local checkpoint intact, continuing"
-}
-
-# ============================================================================
-# DATA PREPARATION
-#   sft_data.jsonl - Skill_MATH (skill-labeled)
-# ============================================================================
-
-echo ""
-echo "======================================================================"
-echo "PREPARING DATA"
-echo "======================================================================"
-
-if [ ! -f outputs/sft_data_full.jsonl ]; then
-    echo "[DATA] Building Skill_MATH SFT dataset..."
-
-    python data_pipeline.py \
-        --build-sft \
-        --split train \
-        --out outputs/sft_data_full.jsonl
-else
-    echo "[DATA] Skill_MATH SFT dataset already exists."
-fi
-
-if [ "$TRAIN_N" = "full" ]; then
-    cp outputs/sft_data_full.jsonl "$OUT/sft_data.jsonl"
-else
-    head -n "$TRAIN_N" outputs/sft_data_full.jsonl > "$OUT/sft_data.jsonl"
-fi
-
-echo "[DATA] Skill_MATH training examples:"
-wc -l "$OUT/sft_data.jsonl"
-
-# ============================================================================
-# STAGE 0 - BASELINE
-# ============================================================================
-
-echo ""
-echo "======================================================================"
-echo "STAGE 0: BASELINE"
-echo "======================================================================"
-
-run_vllm_eval \
-    "$MODEL" \
-    "$OUT/predictions_baseline.jsonl"
-
-run_score \
-    "$OUT/predictions_baseline.jsonl" \
-    "$OUT/eval_baseline_detailed.jsonl" \
-    "$OUT/eval_baseline_summary.json"
-
-python3 -c "
-import json
-json.dump(
-    {'model': '${MODEL}', 'mode': 'baseline'},
-    open('${OUT}/baseline_config.json', 'w'),
-    indent=2
-)
-"
-
-run_log \
-    "${MODEL_SLUG}__baseline" \
-    "$OUT/baseline_config.json" \
-    "$OUT/eval_baseline_summary.json" \
-    "" \
-    "vanilla, untrained, n=$TEST_N"
-
-# ============================================================================
-# SFT VARIANT FUNCTION
-#
-#   $1 variant name
-#   $2 training data file
-#   $3 extra augmented data, "" for none
-#   $4 use replay? yes/no
-#   $5 ledger baseline run_id
-#   $6 notes
-# ============================================================================
-
-run_sft_variant() {
-    local VARIANT_NAME="$1"
-    local DATA_FILE="$2"
-    local EXTRA_DATA="${3:-}"
-    local USE_REPLAY="${4:-no}"
-    local BASELINE_ID="$5"
-    local NOTES="$6"
-
-    local OUT_DIR="${CKPT}/${VARIANT_NAME}"
-
-    echo ""
-    echo "======================================================================"
-    echo "SFT VARIANT: $VARIANT_NAME"
-    echo "======================================================================"
-    echo "[SFT] data:       $DATA_FILE"
-    echo "[SFT] extra data: ${EXTRA_DATA:-<none>}"
-    echo "[SFT] replay:     $USE_REPLAY"
-
-    local REPLAY_ARGS=()
-
-    if [ "$USE_REPLAY" = "yes" ]; then
-        REPLAY_ARGS=(
-            --replay_strategy skill
-            --replay_ratio "$REPLAY_RATIO"
-            --replay_mode "$REPLAY_MODE"
-        )
-    fi
-
-    local EXTRA_ARGS=()
-
-    if [ -n "$EXTRA_DATA" ]; then
-        EXTRA_ARGS=(--extra_data $EXTRA_DATA)
-    fi
-
-    python sft_train.py \
-        --model "$MODEL" \
-        --data "$DATA_FILE" \
-        "${EXTRA_ARGS[@]}" \
-        "${REPLAY_ARGS[@]}" \
-        --mode lora \
-        --lora_r "$LORA_R" \
-        --lora_alpha "$LORA_ALPHA" \
-        --output_dir "$OUT_DIR" \
-        --epochs "$EPOCHS" \
-        --save_every_epochs "$SAVE_EVERY_EPOCHS" \
-        --per_device_batch_size "$PER_DEVICE_BATCH" \
-        --grad_accum "$GRAD_ACCUM"
-
-    echo ""
-    echo "[SFT] Final merged model: ${OUT_DIR}_merged"
-
-    run_vllm_eval \
-        "${OUT_DIR}_merged" \
-        "$OUT/predictions_${VARIANT_NAME}.jsonl"
-
-    run_score \
-        "$OUT/predictions_${VARIANT_NAME}.jsonl" \
-        "$OUT/eval_${VARIANT_NAME}_detailed.jsonl" \
-        "$OUT/eval_${VARIANT_NAME}_summary.json"
-
-    run_log \
-        "${MODEL_SLUG}__${VARIANT_NAME}" \
-        "${OUT_DIR}_merged/training_config.json" \
-        "$OUT/eval_${VARIANT_NAME}_summary.json" \
-        "$BASELINE_ID" \
-        "$NOTES"
-
-    push_model_hf \
-        "${OUT_DIR}_merged" \
-        "$VARIANT_NAME"
-}
-
-# ============================================================================
-# STAGE 1 - SFT ON SKILL_MATH
-# ============================================================================
-
-run_sft_variant \
-    "sft_skill" \
-    "$OUT/sft_data.jsonl" \
-    "" \
-    "no" \
-    "${MODEL_SLUG}__baseline" \
-    "SFT on Skill_MATH (skill-labeled), n=$TEST_N"
-
-# ============================================================================
-# STAGE 2 - DIAGNOSIS
-# ============================================================================
-
-echo ""
-echo "======================================================================"
-echo "STAGE 2: DIAGNOSIS"
-echo "======================================================================"
-
-python data_pipeline.py \
-    --diagnose \
-    --predictions "$OUT/predictions_sft_skill.jsonl" \
-    --weak-report "$OUT/weak_clusters.json"
-
-cat "$OUT/weak_clusters.json"
-
-echo "[OK] Diagnosis completed."
-
-# ============================================================================
-# STAGE 2 - AUGMENTATION GENERATION
-# ============================================================================
-
-echo ""
-echo "======================================================================"
-echo "STAGE 2: AUGMENTATION GENERATION"
-echo "======================================================================"
-
-echo "[AUG] semantic..."
-
-python run_augmentation.py \
-    --stage semantic \
-    --model "${CKPT}/sft_skill_merged" \
-    --weak_report "$OUT/weak_clusters.json" \
-    --out "$OUT/semantic_aug.jsonl" \
-    "${AUG_SOURCE_ARG[@]}" \
-    --batch_size 64
-
-echo "[OK] Semantic augmentation completed."
-
-echo "[AUG] numeric..."
-
-python run_augmentation.py \
-    --stage numeric \
-    --model "${CKPT}/sft_skill_merged" \
-    --weak_report "$OUT/weak_clusters.json" \
-    --out "$OUT/numeric_aug.jsonl" \
-    --n_per_problem 1 \
-    --votes 3 \
-    "${AUG_SOURCE_ARG[@]}" \
-    --batch_size 64
-
-echo "[OK] Numeric augmentation completed."
-
-# ============================================================================
-# STAGE 3 - REPLAY VARIANTS
-#
-#   1. Simple Replay
-#   2. Semantic Replay
-#   3. Numeric Replay
-#   4. Semantic + Numeric Replay
-# ============================================================================
-
-echo ""
-echo "======================================================================"
-echo "STAGE 3: REPLAY VARIANTS"
-echo "======================================================================"
-
-run_sft_variant \
-    "simple_replay" \
-    "$OUT/sft_data.jsonl" \
-    "" \
-    "yes" \
-    "${MODEL_SLUG}__sft_skill" \
-    "Skill_MATH + simple skill replay, n=$TEST_N"
-
-run_sft_variant \
-    "sem_replay" \
-    "$OUT/sft_data.jsonl" \
-    "$OUT/semantic_aug.jsonl" \
-    "yes" \
-    "${MODEL_SLUG}__sft_skill" \
-    "Skill_MATH + semantic augmentation + replay, n=$TEST_N"
-
-run_sft_variant \
-    "num_replay" \
-    "$OUT/sft_data.jsonl" \
-    "$OUT/numeric_aug.jsonl" \
-    "yes" \
-    "${MODEL_SLUG}__sft_skill" \
-    "Skill_MATH + numeric augmentation + replay, n=$TEST_N"
-
-run_sft_variant \
-    "both_replay" \
-    "$OUT/sft_data.jsonl" \
-    "$OUT/semantic_aug.jsonl $OUT/numeric_aug.jsonl" \
-    "yes" \
-    "${MODEL_SLUG}__sft_skill" \
-    "Skill_MATH + semantic & numeric augmentation + replay, n=$TEST_N"
-
-# ============================================================================
-# STAGE 4 - GRPO FUNCTION
-# ============================================================================
-
-run_stage4_grpo() {
-    local BASE_NAME="$1"
-    local BASE_MODEL_DIR="$2"
-
-    local GRPO_DIR="${CKPT}/grpo_${BASE_NAME}"
-
-    echo ""
-    echo "======================================================================"
-    echo "STAGE 4: GRPO ON ${BASE_NAME}"
-    echo "======================================================================"
-
-    python grpo_train.py \
-        --model "$BASE_MODEL_DIR" \
-        --data "$OUT/sft_data.jsonl" \
-        --output_dir "$GRPO_DIR" \
-        --num_generations "$GRPO_GENERATIONS" \
-        --per_device_batch_size 4 \
-        --grad_accum 1 \
-        --num_train_epochs "$GRPO_EPOCHS" \
-        --w_correctness 1.0 \
-        --w_format 0.2 \
-        --w_persistence 0.15 \
-        --w_chain_stability 0.25
-
-    echo ""
-    echo "[GRPO] Final merged model: ${GRPO_DIR}_merged"
-
-    run_vllm_eval \
-        "${GRPO_DIR}_merged" \
-        "$OUT/predictions_grpo_${BASE_NAME}.jsonl"
-
-    run_score \
-        "$OUT/predictions_grpo_${BASE_NAME}.jsonl" \
-        "$OUT/eval_grpo_${BASE_NAME}_detailed.jsonl" \
-        "$OUT/eval_grpo_${BASE_NAME}_summary.json"
-
-    run_log \
-        "${MODEL_SLUG}__grpo_${BASE_NAME}" \
-        "${GRPO_DIR}_merged/training_config.json" \
-        "$OUT/eval_grpo_${BASE_NAME}_summary.json" \
-        "${MODEL_SLUG}__${BASE_NAME}" \
-        "GRPO on ${BASE_NAME}, n=$TEST_N"
-
-    push_model_hf \
-        "${GRPO_DIR}_merged" \
-        "grpo_${BASE_NAME}"
-}
-
-# ============================================================================
-# STAGE 4 - GRPO ON THE FIVE SKILL_MATH SFT MODELS
-#
-#   1. SFT Skill_MATH
-#   2. Simple Replay
-#   3. Semantic Replay
-#   4. Numeric Replay
-#   5. Semantic + Numeric Replay
-# ============================================================================
-
-run_stage4_grpo \
-    "sft_skill" \
-    "${CKPT}/sft_skill_merged"
-
-run_stage4_grpo \
-    "simple_replay" \
-    "${CKPT}/simple_replay_merged"
-
-run_stage4_grpo \
-    "sem_replay" \
-    "${CKPT}/sem_replay_merged"
-
-run_stage4_grpo \
-    "num_replay" \
-    "${CKPT}/num_replay_merged"
-
-run_stage4_grpo \
-    "both_replay" \
-    "${CKPT}/both_replay_merged"
-
-# ============================================================================
-# REPORTS
-# ============================================================================
-
-echo ""
-echo "======================================================================"
-echo "GENERATING REPORTS"
-echo "======================================================================"
-
-python experiment_ledger.py \
-    --print \
-    --ledger "$LEDGER"
-
-python generate_all_reports.py \
-    --ledger "$LEDGER" \
-    --out_dir outputs/report
-
-# ============================================================================
-# HUGGING FACE - PUSH ALL ARTIFACTS
-# ============================================================================
-
-if [ -z "${SMART_HF_DISABLE:-}" ]; then
-
-    echo ""
-    echo "======================================================================"
-    echo "PUSHING ARTIFACTS TO $SMART_HF_OUTPUTS_REPO"
-    echo "======================================================================"
+    echo "============================================================"
+    echo "[HF] Uploading experiment outputs"
+    echo "============================================================"
 
     python hf_sync.py \
-        --push-outputs \
-        --model-slug "$MODEL_SLUG" \
-        || echo "[HF] WARNING: outputs push failed - local artifacts are intact"
+        --push-outputs "${OUT}"
+
+    echo "[HF] Output upload completed."
+}
+
+
+# ============================================================
+# PROGRESSIVE CLEANUP
+# ============================================================
+
+cleanup_variant_pair() {
+
+    local BASE_NAME="$1"
+    local GRPO_VARIANT="$2"
+
+    local SFT_DIR="${CKPT}/${BASE_NAME}"
+    local SFT_MERGED="${CKPT}/${BASE_NAME}_merged"
+
+    local GRPO_DIR="${CKPT}/grpo_${GRPO_VARIANT}"
+    local GRPO_MERGED="${GRPO_DIR}_merged"
+
+
+    echo ""
+    echo "============================================================"
+    echo "[CLEANUP] Checking ${BASE_NAME}"
+    echo "============================================================"
+
+
+    if [ "${SMART_HF_DISABLE}" = "1" ]; then
+
+        echo "[CLEANUP] HF disabled."
+        echo "[CLEANUP] Keeping local files."
+
+        return 0
+    fi
+
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Delete only if BOTH SFT and GRPO were uploaded.
+    # --------------------------------------------------------
+
+    if [ "${PUSH_OK[${BASE_NAME}]:-no}" = "yes" ] && \
+       [ "${PUSH_OK[${GRPO_VARIANT}]:-no}" = "yes" ]; then
+
+        echo "[CLEANUP] Both uploads confirmed."
+        echo "[CLEANUP] Removing local SFT + GRPO checkpoints."
+
+
+        if [ -d "${SFT_DIR}" ]; then
+            echo "[CLEANUP] Removing ${SFT_DIR}"
+            rm -rf "${SFT_DIR}"
+        fi
+
+
+        if [ -d "${SFT_MERGED}" ]; then
+            echo "[CLEANUP] Removing ${SFT_MERGED}"
+            rm -rf "${SFT_MERGED}"
+        fi
+
+
+        if [ -d "${GRPO_DIR}" ]; then
+            echo "[CLEANUP] Removing ${GRPO_DIR}"
+            rm -rf "${GRPO_DIR}"
+        fi
+
+
+        if [ -d "${GRPO_MERGED}" ]; then
+            echo "[CLEANUP] Removing ${GRPO_MERGED}"
+            rm -rf "${GRPO_MERGED}"
+        fi
+
+
+        echo "[CLEANUP] Completed."
+
+    else
+
+        echo "[CLEANUP] WARNING:"
+        echo "[CLEANUP] One or both HF uploads were NOT confirmed."
+        echo "[CLEANUP] Keeping local checkpoints for safety."
+
+    fi
+
+
+    check_disk
+}
+
+
+# ============================================================
+# VLLM EVALUATION
+# ============================================================
+
+run_vllm_eval() {
+
+    local MODEL_PATH="$1"
+    local SPLIT="$2"
+    local OUT_FILE="$3"
+
+    echo ""
+    echo "============================================================"
+    echo "[EVAL] vLLM evaluation"
+    echo "============================================================"
+    echo "Model : ${MODEL_PATH}"
+    echo "Split : ${SPLIT}"
+    echo "Output: ${OUT_FILE}"
+    echo "============================================================"
+
+
+    if [ "${USE_VLLM}" = "1" ]; then
+
+        python run_eval.py \
+            --model "${MODEL_PATH}" \
+            --split "${SPLIT}" \
+            --out "${OUT_FILE}" \
+            --use_vllm \
+            --max_tokens "${MAX_TOKENS}"
+
+    else
+
+        python run_eval.py \
+            --model "${MODEL_PATH}" \
+            --split "${SPLIT}" \
+            --out "${OUT_FILE}" \
+            --max_tokens "${MAX_TOKENS}"
+
+    fi
+}
+
+
+# ============================================================
+# SCORE EVALUATION
+# ============================================================
+
+run_score() {
+
+    local PREDICTIONS="$1"
+
+    echo ""
+    echo "============================================================"
+    echo "[SCORE]"
+    echo "============================================================"
+
+    python evaluator.py \
+        --predictions "${PREDICTIONS}"
+
+}
+
+
+# ============================================================
+# LEDGER LOG
+# ============================================================
+
+run_log() {
+
+    local RUN_ID="$1"
+    local MODEL_NAME="$2"
+    local STAGE="$3"
+    local VARIANT="$4"
+    local PREDICTIONS="$5"
+
+    echo ""
+    echo "[LEDGER] Logging ${RUN_ID}"
+
+    python experiment_ledger.py \
+        --run_id "${RUN_ID}" \
+        --model "${MODEL_NAME}" \
+        --stage "${STAGE}" \
+        --variant "${VARIANT}" \
+        --predictions "${PREDICTIONS}"
+
+}
+
+
+# ============================================================
+# SFT TRAINING
+# ============================================================
+
+run_sft_variant() {
+
+    local VARIANT="$1"
+
+    local DATA_ARG=""
+    local EXTRA_ARG=""
+
+    case "${VARIANT}" in
+
+        sft_skill)
+
+            DATA_ARG="${OUT}/sft_data.jsonl"
+
+            ;;
+
+        simple_replay)
+
+            DATA_ARG="${OUT}/sft_data.jsonl"
+            EXTRA_ARG="--extra_data ${OUT}/sft_data.jsonl"
+
+            ;;
+
+        sem_replay)
+
+            DATA_ARG="${OUT}/sft_data.jsonl"
+            EXTRA_ARG="--extra_data ${OUT}/semantic_aug.jsonl"
+
+            ;;
+
+        num_replay)
+
+            DATA_ARG="${OUT}/sft_data.jsonl"
+            EXTRA_ARG="--extra_data ${OUT}/numeric_aug.jsonl"
+
+            ;;
+
+        both_replay)
+
+            DATA_ARG="${OUT}/sft_data.jsonl"
+            EXTRA_ARG="--extra_data ${OUT}/semantic_aug.jsonl ${OUT}/numeric_aug.jsonl"
+
+            ;;
+
+        *)
+
+            echo "[SFT] ERROR: Unknown variant ${VARIANT}"
+            exit 1
+
+            ;;
+
+    esac
+
+
+    echo ""
+    echo "============================================================"
+    echo "[SFT] ${VARIANT}"
+    echo "============================================================"
+
+
+    python sft_train.py \
+        --model "${MODEL}" \
+        --train_file "${DATA_ARG}" \
+        --output_dir "${CKPT}/${VARIANT}" \
+        --lora_r "${LORA_R}" \
+        --lora_alpha "${LORA_ALPHA}" \
+        --num_train_epochs "${EPOCHS}" \
+        --save_every_epochs "${SAVE_EVERY_EPOCHS}" \
+        --per_device_train_batch_size "${PER_DEVICE_BATCH_SIZE}" \
+        --gradient_accumulation_steps "${GRAD_ACCUM}" \
+        --attn_implementation flash_attention_2 \
+        ${EXTRA_ARG}
+
+
+    echo ""
+    echo "[SFT] Training completed: ${VARIANT}"
+
+
+    echo ""
+    echo "[SFT] Merging LoRA adapter..."
+
+    python sft_train.py \
+        --merge_only \
+        --adapter_path "${CKPT}/${VARIANT}" \
+        --output_dir "${CKPT}/${VARIANT}_merged"
+
+
+    echo ""
+    echo "[SFT] Merge completed: ${VARIANT}_merged"
+
+
+    check_disk
+}
+
+
+# ============================================================
+# STAGE 0 - BASELINE
+# ============================================================
+
+echo ""
+echo "============================================================"
+echo " STAGE 0 - BASELINE"
+echo "============================================================"
+
+BASELINE_PRED="${OUT}/baseline_predictions.jsonl"
+
+run_vllm_eval \
+    "${MODEL}" \
+    "test" \
+    "${BASELINE_PRED}"
+
+run_score "${BASELINE_PRED}"
+
+run_log \
+    "qwen_baseline" \
+    "${MODEL}" \
+    "baseline" \
+    "baseline" \
+    "${BASELINE_PRED}"
+
+
+# ============================================================
+# STAGE 1 - SKILL-AWARE SFT
+# ============================================================
+
+echo ""
+echo "============================================================"
+echo " STAGE 1 - SKILL-AWARE SFT"
+echo "============================================================"
+
+
+# ------------------------------------------------------------
+# Train Skill SFT
+# ------------------------------------------------------------
+
+run_sft_variant "sft_skill"
+
+
+# ------------------------------------------------------------
+# Evaluate Skill SFT
+# ------------------------------------------------------------
+
+SFT_SKILL_PRED="${OUT}/sft_skill_predictions.jsonl"
+
+run_vllm_eval \
+    "${CKPT}/sft_skill_merged" \
+    "test" \
+    "${SFT_SKILL_PRED}"
+
+run_score "${SFT_SKILL_PRED}"
+
+run_log \
+    "qwen_sft_skill" \
+    "${MODEL}" \
+    "sft" \
+    "sft_skill" \
+    "${SFT_SKILL_PRED}"
+
+
+# ============================================================
+# STAGE 2 - DIAGNOSIS + AUGMENTATION
+# ============================================================
+
+echo ""
+echo "============================================================"
+echo " STAGE 2 - DIAGNOSIS + AUGMENTATION"
+echo "============================================================"
+
+
+# ------------------------------------------------------------
+# Diagnosis
+# ------------------------------------------------------------
+
+echo ""
+echo "[DIAGNOSIS] Running skill diagnosis..."
+
+python run_augmentation.py \
+    --mode diagnose \
+    --model "${CKPT}/sft_skill_merged" \
+    --train_file "${OUT}/sft_data.jsonl" \
+    --test_file "${OUT}/sft_skill_predictions.jsonl" \
+    --out_dir "${OUT}"
+
+
+# ------------------------------------------------------------
+# Semantic augmentation
+# ------------------------------------------------------------
+
+echo ""
+echo "[AUGMENTATION] Semantic..."
+
+python run_augmentation.py \
+    --mode semantic \
+    --model "${CKPT}/sft_skill_merged" \
+    --out_dir "${OUT}" \
+    --output "${OUT}/semantic_aug.jsonl"
+
+
+# ------------------------------------------------------------
+# Numeric augmentation
+# ------------------------------------------------------------
+
+echo ""
+echo "[AUGMENTATION] Numeric..."
+
+python run_augmentation.py \
+    --mode numeric \
+    --model "${CKPT}/sft_skill_merged" \
+    --out_dir "${OUT}" \
+    --output "${OUT}/numeric_aug.jsonl"
+
+
+check_disk
+
+
+# ============================================================
+# STAGE 3 - PROGRESSIVE REPLAY + GRPO
+# ============================================================
+
+echo ""
+echo "============================================================"
+echo " STAGE 3 - PROGRESSIVE REPLAY + GRPO"
+echo "============================================================"
+
+
+# ============================================================
+# VARIANT 1 - SIMPLE SKILL
+# ============================================================
+
+echo ""
+echo "############################################################"
+echo "# VARIANT: SIMPLE SKILL"
+echo "############################################################"
+
+
+# ------------------------------------------------------------
+# GRPO directly on Skill SFT
+# ------------------------------------------------------------
+
+GRPO_VARIANT="sft_skill"
+BASE_VARIANT="sft_skill"
+
+GRPO_DIR="${CKPT}/grpo_${GRPO_VARIANT}"
+
+echo ""
+echo "[GRPO] Training ${GRPO_VARIANT}"
+
+
+python grpo_train.py \
+    --model "${CKPT}/${BASE_VARIANT}_merged" \
+    --output_dir "${GRPO_DIR}" \
+    --w_correctness "${GRPO_W_CORRECTNESS}" \
+    --w_format "${GRPO_W_FORMAT}" \
+    --w_persistence "${GRPO_W_PERSISTENCE}" \
+    --w_chain_stability "${GRPO_W_CHAIN_STABILITY}" \
+    --attn_implementation flash_attention_2
+
+
+echo ""
+echo "[GRPO] Merging ${GRPO_VARIANT}"
+
+
+python grpo_train.py \
+    --merge_only \
+    --adapter_path "${GRPO_DIR}" \
+    --output_dir "${GRPO_DIR}_merged"
+
+
+# ------------------------------------------------------------
+# Evaluate GRPO
+# ------------------------------------------------------------
+
+GRPO_PRED="${OUT}/grpo_${GRPO_VARIANT}_predictions.jsonl"
+
+run_vllm_eval \
+    "${GRPO_DIR}_merged" \
+    "test" \
+    "${GRPO_PRED}"
+
+run_score "${GRPO_PRED}"
+
+run_log \
+    "qwen_grpo_${GRPO_VARIANT}" \
+    "${MODEL}" \
+    "grpo" \
+    "${GRPO_VARIANT}" \
+    "${GRPO_PRED}"
+
+
+# ------------------------------------------------------------
+# Upload SFT + GRPO
+# ------------------------------------------------------------
+
+push_model_hf \
+    "${CKPT}/${BASE_VARIANT}_merged" \
+    "${BASE_VARIANT}"
+
+push_model_hf \
+    "${GRPO_DIR}_merged" \
+    "${GRPO_VARIANT}"
+
+
+# ------------------------------------------------------------
+# IMPORTANT:
+# Do NOT delete sft_skill yet until augmentation is complete.
+# Now augmentation IS complete, so cleanup is safe.
+# ------------------------------------------------------------
+
+cleanup_variant_pair \
+    "${BASE_VARIANT}" \
+    "${GRPO_VARIANT}"
+
+
+# ============================================================
+# VARIANT 2 - SIMPLE REPLAY
+# ============================================================
+
+echo ""
+echo "############################################################"
+echo "# VARIANT: SIMPLE REPLAY"
+echo "############################################################"
+
+
+BASE_VARIANT="simple_replay"
+GRPO_VARIANT="simple_replay"
+
+
+run_sft_variant "${BASE_VARIANT}"
+
+
+# ------------------------------------------------------------
+# SFT evaluation
+# ------------------------------------------------------------
+
+SFT_PRED="${OUT}/${BASE_VARIANT}_predictions.jsonl"
+
+run_vllm_eval \
+    "${CKPT}/${BASE_VARIANT}_merged" \
+    "test" \
+    "${SFT_PRED}"
+
+run_score "${SFT_PRED}"
+
+run_log \
+    "qwen_${BASE_VARIANT}" \
+    "${MODEL}" \
+    "replay_sft" \
+    "${BASE_VARIANT}" \
+    "${SFT_PRED}"
+
+
+# ------------------------------------------------------------
+# GRPO
+# ------------------------------------------------------------
+
+GRPO_DIR="${CKPT}/grpo_${GRPO_VARIANT}"
+
+python grpo_train.py \
+    --model "${CKPT}/${BASE_VARIANT}_merged" \
+    --output_dir "${GRPO_DIR}" \
+    --w_correctness "${GRPO_W_CORRECTNESS}" \
+    --w_format "${GRPO_W_FORMAT}" \
+    --w_persistence "${GRPO_W_PERSISTENCE}" \
+    --w_chain_stability "${GRPO_W_CHAIN_STABILITY}" \
+    --attn_implementation flash_attention_2
+
+
+python grpo_train.py \
+    --merge_only \
+    --adapter_path "${GRPO_DIR}" \
+    --output_dir "${GRPO_DIR}_merged"
+
+
+# ------------------------------------------------------------
+# GRPO evaluation
+# ------------------------------------------------------------
+
+GRPO_PRED="${OUT}/grpo_${GRPO_VARIANT}_predictions.jsonl"
+
+run_vllm_eval \
+    "${GRPO_DIR}_merged" \
+    "test" \
+    "${GRPO_PRED}"
+
+run_score "${GRPO_PRED}"
+
+run_log \
+    "qwen_grpo_${GRPO_VARIANT}" \
+    "${MODEL}" \
+    "grpo" \
+    "${GRPO_VARIANT}" \
+    "${GRPO_PRED}"
+
+
+# ------------------------------------------------------------
+# Upload + cleanup
+# ------------------------------------------------------------
+
+push_model_hf \
+    "${CKPT}/${BASE_VARIANT}_merged" \
+    "${BASE_VARIANT}"
+
+push_model_hf \
+    "${GRPO_DIR}_merged" \
+    "${GRPO_VARIANT}"
+
+cleanup_variant_pair \
+    "${BASE_VARIANT}" \
+    "${GRPO_VARIANT}"
+
+
+# ============================================================
+# VARIANT 3 - SEMANTIC REPLAY
+# ============================================================
+
+echo ""
+echo "############################################################"
+echo "# VARIANT: SEMANTIC REPLAY"
+echo "############################################################"
+
+
+BASE_VARIANT="sem_replay"
+GRPO_VARIANT="sem_replay"
+
+
+run_sft_variant "${BASE_VARIANT}"
+
+
+SFT_PRED="${OUT}/${BASE_VARIANT}_predictions.jsonl"
+
+run_vllm_eval \
+    "${CKPT}/${BASE_VARIANT}_merged" \
+    "test" \
+    "${SFT_PRED}"
+
+run_score "${SFT_PRED}"
+
+run_log \
+    "qwen_${BASE_VARIANT}" \
+    "${MODEL}" \
+    "replay_sft" \
+    "${BASE_VARIANT}" \
+    "${SFT_PRED}"
+
+
+# ------------------------------------------------------------
+# GRPO
+# ------------------------------------------------------------
+
+GRPO_DIR="${CKPT}/grpo_${GRPO_VARIANT}"
+
+python grpo_train.py \
+    --model "${CKPT}/${BASE_VARIANT}_merged" \
+    --output_dir "${GRPO_DIR}" \
+    --w_correctness "${GRPO_W_CORRECTNESS}" \
+    --w_format "${GRPO_W_FORMAT}" \
+    --w_persistence "${GRPO_W_PERSISTENCE}" \
+    --w_chain_stability "${GRPO_W_CHAIN_STABILITY}" \
+    --attn_implementation flash_attention_2
+
+
+python grpo_train.py \
+    --merge_only \
+    --adapter_path "${GRPO_DIR}" \
+    --output_dir "${GRPO_DIR}_merged"
+
+
+# ------------------------------------------------------------
+# GRPO evaluation
+# ------------------------------------------------------------
+
+GRPO_PRED="${OUT}/grpo_${GRPO_VARIANT}_predictions.jsonl"
+
+run_vllm_eval \
+    "${GRPO_DIR}_merged" \
+    "test" \
+    "${GRPO_PRED}"
+
+run_score "${GRPO_PRED}"
+
+run_log \
+    "qwen_grpo_${GRPO_VARIANT}" \
+    "${MODEL}" \
+    "grpo" \
+    "${GRPO_VARIANT}" \
+    "${GRPO_PRED}"
+
+
+# ------------------------------------------------------------
+# Upload + cleanup
+# ------------------------------------------------------------
+
+push_model_hf \
+    "${CKPT}/${BASE_VARIANT}_merged" \
+    "${BASE_VARIANT}"
+
+push_model_hf \
+    "${GRPO_DIR}_merged" \
+    "${GRPO_VARIANT}"
+
+cleanup_variant_pair \
+    "${BASE_VARIANT}" \
+    "${GRPO_VARIANT}"
+
+
+# ============================================================
+# VARIANT 4 - NUMERIC REPLAY
+# ============================================================
+
+echo ""
+echo "############################################################"
+echo "# VARIANT: NUMERIC REPLAY"
+echo "############################################################"
+
+
+BASE_VARIANT="num_replay"
+GRPO_VARIANT="num_replay"
+
+
+run_sft_variant "${BASE_VARIANT}"
+
+
+SFT_PRED="${OUT}/${BASE_VARIANT}_predictions.jsonl"
+
+run_vllm_eval \
+    "${CKPT}/${BASE_VARIANT}_merged" \
+    "test" \
+    "${SFT_PRED}"
+
+run_score "${SFT_PRED}"
+
+run_log \
+    "qwen_${BASE_VARIANT}" \
+    "${MODEL}" \
+    "replay_sft" \
+    "${BASE_VARIANT}" \
+    "${SFT_PRED}"
+
+
+# ------------------------------------------------------------
+# GRPO
+# ------------------------------------------------------------
+
+GRPO_DIR="${CKPT}/grpo_${GRPO_VARIANT}"
+
+python grpo_train.py \
+    --model "${CKPT}/${BASE_VARIANT}_merged" \
+    --output_dir "${GRPO_DIR}" \
+    --w_correctness "${GRPO_W_CORRECTNESS}" \
+    --w_format "${GRPO_W_FORMAT}" \
+    --w_persistence "${GRPO_W_PERSISTENCE}" \
+    --w_chain_stability "${GRPO_W_CHAIN_STABILITY}" \
+    --attn_implementation flash_attention_2
+
+
+python grpo_train.py \
+    --merge_only \
+    --adapter_path "${GRPO_DIR}" \
+    --output_dir "${GRPO_DIR}_merged"
+
+
+# ------------------------------------------------------------
+# GRPO evaluation
+# ------------------------------------------------------------
+
+GRPO_PRED="${OUT}/grpo_${GRPO_VARIANT}_predictions.jsonl"
+
+run_vllm_eval \
+    "${GRPO_DIR}_merged" \
+    "test" \
+    "${GRPO_PRED}"
+
+run_score "${GRPO_PRED}"
+
+run_log \
+    "qwen_grpo_${GRPO_VARIANT}" \
+    "${MODEL}" \
+    "grpo" \
+    "${GRPO_VARIANT}" \
+    "${GRPO_PRED}"
+
+
+# ------------------------------------------------------------
+# Upload + cleanup
+# ------------------------------------------------------------
+
+push_model_hf \
+    "${CKPT}/${BASE_VARIANT}_merged" \
+    "${BASE_VARIANT}"
+
+push_model_hf \
+    "${GRPO_DIR}_merged" \
+    "${GRPO_VARIANT}"
+
+cleanup_variant_pair \
+    "${BASE_VARIANT}" \
+    "${GRPO_VARIANT}"
+
+
+# ============================================================
+# VARIANT 5 - BOTH REPLAY
+# ============================================================
+
+echo ""
+echo "############################################################"
+echo "# VARIANT: BOTH REPLAY"
+echo "############################################################"
+
+
+BASE_VARIANT="both_replay"
+GRPO_VARIANT="both_replay"
+
+
+run_sft_variant "${BASE_VARIANT}"
+
+
+SFT_PRED="${OUT}/${BASE_VARIANT}_predictions.jsonl"
+
+run_vllm_eval \
+    "${CKPT}/${BASE_VARIANT}_merged" \
+    "test" \
+    "${SFT_PRED}"
+
+run_score "${SFT_PRED}"
+
+run_log \
+    "qwen_${BASE_VARIANT}" \
+    "${MODEL}" \
+    "replay_sft" \
+    "${BASE_VARIANT}" \
+    "${SFT_PRED}"
+
+
+# ------------------------------------------------------------
+# GRPO
+# ------------------------------------------------------------
+
+GRPO_DIR="${CKPT}/grpo_${GRPO_VARIANT}"
+
+python grpo_train.py \
+    --model "${CKPT}/${BASE_VARIANT}_merged" \
+    --output_dir "${GRPO_DIR}" \
+    --w_correctness "${GRPO_W_CORRECTNESS}" \
+    --w_format "${GRPO_W_FORMAT}" \
+    --w_persistence "${GRPO_W_PERSISTENCE}" \
+    --w_chain_stability "${GRPO_W_CHAIN_STABILITY}" \
+    --attn_implementation flash_attention_2
+
+
+python grpo_train.py \
+    --merge_only \
+    --adapter_path "${GRPO_DIR}" \
+    --output_dir "${GRPO_DIR}_merged"
+
+
+# ------------------------------------------------------------
+# GRPO evaluation
+# ------------------------------------------------------------
+
+GRPO_PRED="${OUT}/grpo_${GRPO_VARIANT}_predictions.jsonl"
+
+run_vllm_eval \
+    "${GRPO_DIR}_merged" \
+    "test" \
+    "${GRPO_PRED}"
+
+run_score "${GRPO_PRED}"
+
+run_log \
+    "qwen_grpo_${GRPO_VARIANT}" \
+    "${MODEL}" \
+    "grpo" \
+    "${GRPO_VARIANT}" \
+    "${GRPO_PRED}"
+
+
+# ------------------------------------------------------------
+# Upload + cleanup
+# ------------------------------------------------------------
+
+push_model_hf \
+    "${CKPT}/${BASE_VARIANT}_merged" \
+    "${BASE_VARIANT}"
+
+push_model_hf \
+    "${GRPO_DIR}_merged" \
+    "${GRPO_VARIANT}"
+
+cleanup_variant_pair \
+    "${BASE_VARIANT}" \
+    "${GRPO_VARIANT}"
+
+
+# ============================================================
+# FINAL CLEANUP
+# ============================================================
+
+echo ""
+echo "============================================================"
+echo " FINAL CLEANUP"
+echo "============================================================"
+
+
+if [ "${SMART_HF_DISABLE}" = "1" ]; then
+
+    echo "[FINAL CLEANUP] HF disabled."
+    echo "[FINAL CLEANUP] Keeping shared experiment data."
+
+else
+
+    echo "[FINAL CLEANUP] Removing temporary augmentation datasets."
+
+    rm -f "${OUT}/sft_data.jsonl" || true
+    rm -f "${OUT}/semantic_aug.jsonl" || true
+    rm -f "${OUT}/numeric_aug.jsonl" || true
 
 fi
 
-# ============================================================================
-# DONE
-# ============================================================================
+
+# ============================================================
+# UPLOAD EXPERIMENT OUTPUTS
+# ============================================================
+
+push_outputs_hf
+
+
+# ============================================================
+# FINAL DISK STATUS
+# ============================================================
+
+check_disk
+
+
+# ============================================================
+# COMPLETION
+# ============================================================
 
 echo ""
-echo "======================================================================"
-echo "SMART EXPERIMENT LADDER COMPLETE"
-echo "======================================================================"
-
-echo "MODEL: $MODEL"
+echo "============================================================"
+echo " SMARTY - QWEN EXPERIMENT COMPLETE"
+echo "============================================================"
 echo ""
-
-echo "Stage 0:"
-echo "  ${MODEL_SLUG}__baseline"
-
+echo "Model:"
+echo "  ${MODEL}"
 echo ""
-echo "Stage 1:"
-echo "  ${MODEL_SLUG}__sft_skill"
-
+echo "Completed:"
+echo "  [x] Baseline"
+echo "  [x] Skill SFT"
+echo "  [x] Diagnosis"
+echo "  [x] Semantic augmentation"
+echo "  [x] Numeric augmentation"
+echo "  [x] Simple Replay SFT + GRPO"
+echo "  [x] Semantic Replay SFT + GRPO"
+echo "  [x] Numeric Replay SFT + GRPO"
+echo "  [x] Both Replay SFT + GRPO"
 echo ""
-echo "Stage 3:"
-echo "  ${MODEL_SLUG}__simple_replay"
-echo "  ${MODEL_SLUG}__sem_replay"
-echo "  ${MODEL_SLUG}__num_replay"
-echo "  ${MODEL_SLUG}__both_replay"
-
+echo "Outputs:"
+echo "  ${OUT}"
 echo ""
-echo "Stage 4:"
-echo "  ${MODEL_SLUG}__grpo_sft_skill"
-echo "  ${MODEL_SLUG}__grpo_simple_replay"
-echo "  ${MODEL_SLUG}__grpo_sem_replay"
-echo "  ${MODEL_SLUG}__grpo_num_replay"
-echo "  ${MODEL_SLUG}__grpo_both_replay"
-
+echo "Ledger:"
+echo "  ${LEDGER}"
 echo ""
-echo "Total evaluation runs: 10"
-echo "  1 baseline"
-echo "  1 Skill_MATH SFT"
-echo "  4 replay SFT"
-echo "  5 GRPO"
-
-echo ""
-echo "Checkpoint evaluations: none (end evaluation only)"
-echo ""
-echo "Ledger:      $LEDGER"
-echo "Report:      outputs/report/"
-echo "HF SFT:      https://huggingface.co/$SMART_HF_SFT_REPO"
-echo "HF Replay:   https://huggingface.co/$SMART_HF_REPLAY_REPO"
-echo "HF GRPO:     https://huggingface.co/$SMART_HF_GRPO_REPO"
-echo "HF Outputs:  https://huggingface.co/datasets/$SMART_HF_OUTPUTS_REPO"
-
-echo "======================================================================"
-
+echo "============================================================"
