@@ -78,7 +78,7 @@ def select_attn_implementation(prefer_flash: bool = True) -> str:
 
     Resolution order:
       1. SMART_ATTN_IMPL environment variable, if set (full manual override).
-      2. "kernels-community/flash-attn2@v2" - the default.
+      2. "kernels-community/flash-attn2@v3" - the default.
 
     Why the Hub-kernel string rather than plain "flash_attention_2":
 
@@ -106,7 +106,7 @@ def select_attn_implementation(prefer_flash: bool = True) -> str:
     override = os.environ.get("SMART_ATTN_IMPL", "").strip()
     if override:
         return override
-    return "kernels-community/flash-attn2@v2"
+    return "kernels-community/flash-attn2@v3"
 
 
 def load_model_with_best_attention(model_class, model_name_or_path, **kwargs):
