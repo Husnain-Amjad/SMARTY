@@ -53,6 +53,45 @@ def is_rocm() -> bool:
     return torch.cuda.is_available() and bool(getattr(torch.version, "hip", None))
 
 
+def stratified_subsample(rows: list, limit: int, seed: int = 42) -> list:
+    """
+    Subsamples `rows` to ~`limit` items, stratified by (subject, level), so the
+    reduced GRPO training set keeps the same subject/difficulty composition as
+    the full set. A plain head/random cut would over-represent whichever
+    clusters happen to be frequent, which then biases the RL signal toward
+    those clusters.
+
+    Each cluster gets a share proportional to its size, with at least 1 item
+    per cluster that is present at all. Deterministic under `seed`.
+    """
+    import random
+    from collections import defaultdict
+    if not limit or limit >= len(rows):
+        return rows
+
+    by_cluster = defaultdict(list)
+    for r in rows:
+        by_cluster[(r.get("subject", "unknown"), str(r.get("level", "unknown")))].append(r)
+
+    rng = random.Random(seed)
+    total = len(rows)
+    out = []
+    for key in sorted(by_cluster):
+        bucket = by_cluster[key]
+        share = max(1, round(limit * len(bucket) / total))
+        share = min(share, len(bucket))
+        out.extend(rng.sample(bucket, share))
+
+    # Proportional rounding can overshoot/undershoot - trim or top up to hit
+    # `limit` as closely as possible without dropping any cluster entirely.
+    rng.shuffle(out)
+    if len(out) > limit:
+        out = out[:limit]
+    print(f"[grpo_train] stratified subsample: {len(out)}/{total} prompts "
+          f"across {len(by_cluster)} (subject, level) clusters")
+    return out
+
+
 def load_grpo_prompts(path, tokenizer, max_prompt_length=None):
     """
     Builds the RL prompt set directly from the raw {problem, subject, level,
@@ -166,6 +205,12 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--data", required=True)
     ap.add_argument("--output_dir", required=True)
+    ap.add_argument("--data_limit", type=int, default=None,
+                     help="cap the number of GRPO training prompts, STRATIFIED by "
+                          "(subject, level) so cluster composition is preserved. GRPO "
+                          "cost scales with prompts x epochs x num_generations, so this "
+                          "is the main lever for making GRPO affordable without changing "
+                          "the SFT data size. Unset = use all prompts.")
     ap.add_argument("--num_generations", type=int, default=8,
                      help="GRPO group size (samples per prompt). Reduce this first "
                           "if you run out of memory - it does not change reward "
@@ -246,6 +291,9 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     train_ds = load_grpo_prompts(args.data, tokenizer, max_prompt_length=args.max_prompt_length)
+    if args.data_limit:
+        train_ds = Dataset.from_list(
+            stratified_subsample(list(train_ds), args.data_limit, seed=args.seed))
 
     # Build the model explicitly (rather than passing a bare model-name string
     # to GRPOTrainer) so we control attn_implementation for CUDA/ROCm portability -
@@ -279,8 +327,11 @@ def main():
         gradient_checkpointing=args.gradient_checkpointing,
         use_vllm=args.use_vllm,          # rollouts via vLLM - critical for throughput
         logging_steps=5,
-        save_strategy="steps",
-        save_steps=50,
+        save_strategy="epoch",   # was: save_strategy="steps", save_steps=50 (hardcoded).
+                                 # Step-based saving every 50 steps produces dozens
+                                 # or hundreds of checkpoints on a real dataset -
+                                 # epoch-based gives exactly num_train_epochs of them,
+                                 # which is what per-epoch evaluation actually needs.
         report_to=[],
     )
     try:

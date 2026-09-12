@@ -74,52 +74,91 @@ def recommended_batch_size(gpu_memory_gb: float, backend: str = "vllm") -> int:
 
 def select_attn_implementation(prefer_flash: bool = True) -> str:
     """
-    Returns "flash_attention_2" unconditionally.
+    Returns the attention implementation to use for training. Never sdpa.
 
-    This pipeline targets NVIDIA CUDA GPUs (Ampere-class or newer) where
-    flash-attention-2 is both available and the intended kernel, so attention
-    selection is fixed rather than auto-negotiated. Auto-fallback to sdpa was
-    removed deliberately: a silent downgrade meant training runs could differ
-    in kernel between machines without that being visible in any log or config,
-    which is exactly the kind of hidden variation that makes results hard to
-    reproduce.
+    Resolution order:
+      1. SMART_ATTN_IMPL environment variable, if set (full manual override).
+      2. "kernels-community/flash-attn2@v2" - the default.
 
-    If flash-attn is genuinely unavailable, the model load will now FAIL
-    LOUDLY with the underlying error rather than quietly proceeding on a
-    different kernel - install it with:
-        pip install flash-attn --no-build-isolation
-    (requires compute capability >= 8.0; see setup_environment.sh)
+    Why the Hub-kernel string rather than plain "flash_attention_2":
+
+      transformers>=5 resolves "flash_attention_2" to the compiled flash-attn
+      pip package if present, and otherwise FALLS BACK to the
+      kernels-community/flash-attn2 Hub kernel. Both paths work, but the
+      fallback is implicit - nothing in the logs or training_config.json
+      records which one was actually used, and HF documents that the default
+      Hub branch a bare name resolves to "can change from one Transformers
+      release to the next". Naming the repo and pinning the branch makes the
+      kernel an explicit, recorded, reproducible choice instead of an
+      environment-dependent one.
+
+      The @v2 pin also avoids the known v3 issue where CUDA 12.8 builds fail
+      in the backward pass for grouped-query-attention models - which both
+      Qwen2.5-Math and deepseek-math are. (See
+      huggingface/kernels-community#1085.)
+
+    To use the compiled pip package instead, or a different build:
+        export SMART_ATTN_IMPL=flash_attention_2
+        export SMART_ATTN_IMPL=kernels-community/flash-attn2@v3
+        export SMART_ATTN_IMPL=kernels-community/vllm-flash-attn3
     """
-    return "flash_attention_2"
+    import os
+    override = os.environ.get("SMART_ATTN_IMPL", "").strip()
+    if override:
+        return override
+    return "kernels-community/flash-attn2@v2"
 
 
 def load_model_with_best_attention(model_class, model_name_or_path, **kwargs):
     """
-    Loads a model with flash_attention_2. Returns (model, attn_impl_used).
+    Loads a model with the attention implementation from
+    select_attn_implementation(). Returns (model, attn_impl_used).
 
-    There is deliberately NO sdpa fallback here. Silently retrying on a
-    different attention kernel would mean two runs of the "same" config could
-    use different kernels with nothing in the logs or training_config.json to
-    record it. If flash-attn is missing or incompatible, this raises so the
-    problem is fixed once rather than absorbed into every subsequent result.
+    One retry is allowed, and only ever onto ANOTHER flash-attention path -
+    never onto sdpa. If the pinned Hub-kernel string is rejected (e.g. an
+    older transformers that predates Hub-kernel support), this retries with
+    plain "flash_attention_2", which on transformers>=5 itself resolves to
+    the same Hub kernel when the pip package is absent. If that also fails,
+    it raises: a silent downgrade to sdpa would mean two runs of the same
+    config used different kernels with nothing recording it.
     """
     attn_impl = select_attn_implementation()
     try:
         model = model_class.from_pretrained(model_name_or_path,
                                             attn_implementation=attn_impl, **kwargs)
+        print(f"[hardware_utils] loaded {model_name_or_path} with attn_implementation={attn_impl}")
+        return model, attn_impl
     except Exception as e:
-        raise RuntimeError(
-            f"[hardware_utils] failed to load '{model_name_or_path}' with "
-            f"attn_implementation={attn_impl}: {type(e).__name__}: {e}\n"
-            f"This pipeline requires flash-attention-2 (no sdpa fallback, by design - "
-            f"see select_attn_implementation). Install it with:\n"
-            f"    pip install flash-attn --no-build-isolation\n"
-            f"It needs compute capability >= 8.0 (Ampere/A100 or newer) and can take "
-            f"a long time to compile if no prebuilt wheel matches your exact "
-            f"torch/CUDA/Python combination. setup_environment.sh installs it."
-        ) from e
-    print(f"[hardware_utils] loaded {model_name_or_path} with attn_implementation={attn_impl}")
-    return model, attn_impl
+        if attn_impl == "flash_attention_2":
+            raise RuntimeError(
+                f"[hardware_utils] failed to load '{model_name_or_path}' with "
+                f"attn_implementation=flash_attention_2: {type(e).__name__}: {e}\n"
+                f"This pipeline requires flash-attention (no sdpa fallback, by design). "
+                f"Either install the compiled package:\n"
+                f"    pip install flash-attn --no-build-isolation\n"
+                f"or install the kernels library so transformers can pull the Hub kernel:\n"
+                f"    pip install -U kernels"
+            ) from e
+        print(f"[hardware_utils] attn_implementation={attn_impl} was rejected "
+              f"({type(e).__name__}: {e}) - retrying with plain 'flash_attention_2'. "
+              f"On transformers>=5 this resolves to the same Hub kernel when the "
+              f"compiled flash-attn package isn't installed.")
+        try:
+            model = model_class.from_pretrained(model_name_or_path,
+                                                attn_implementation="flash_attention_2", **kwargs)
+            print(f"[hardware_utils] loaded {model_name_or_path} with "
+                  f"attn_implementation=flash_attention_2 (retry)")
+            return model, "flash_attention_2"
+        except Exception as e2:
+            raise RuntimeError(
+                f"[hardware_utils] failed to load '{model_name_or_path}' with both "
+                f"'{attn_impl}' and 'flash_attention_2'. Last error: "
+                f"{type(e2).__name__}: {e2}\n"
+                f"No sdpa fallback by design. Install one of:\n"
+                f"    pip install -U kernels                       # Hub kernel (no compilation)\n"
+                f"    pip install flash-attn --no-build-isolation  # compiled package\n"
+                f"Or override explicitly: export SMART_ATTN_IMPL=<impl>"
+            ) from e2
 
 
 def _try_run(cmd):
